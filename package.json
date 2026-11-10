@@ -2,7 +2,7 @@
   "name": "minyakku-worker-api",
   "version": "1.0.0",
   "description": "Backend Cloudflare Worker untuk ERP Minyak Goreng",
-  "main": "src/index.ts",
+  "main": "worker.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
@@ -13,6 +13,6 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",
     "typescript": "^5.4.0",
-    "wrangler": "^3.50.0"
+    "wrangler": "^3.114.0"
   }
 }

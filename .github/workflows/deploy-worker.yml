@@ -6,10 +6,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'worker/**'
-      - 'wrangler.toml'
-      - '.github/workflows/deploy-worker.yml'
 
 jobs:
   deploy:
@@ -24,11 +20,12 @@ jobs:
         with:
           node-version: 20
 
-      - name: Deploy to Cloudflare Workers via Wrangler
+      - name: Deploy to Cloudflare Workers via Wrangler Latest
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          accountId: "0fb0eac92e0637fca3c730b55a2812eb"
+          wranglerVersion: "latest"
           command: deploy
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
