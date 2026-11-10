@@ -13,3 +13,9 @@ WA_SENDER_NUMBER = "6282320379721"
 
 # Opsional: Jika menggunakan Cloudflare R2 bawaan akun Anda
 # R2_ENDPOINT = "https://0fb0eac92e0637fca3c730b55a2812eb.r2.cloudflarestorage.com"
+
+# ...
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "a47a1f52c2a34dd4bfbbfa939ba179c6"
+# ...
