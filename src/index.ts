@@ -63,10 +63,11 @@ export default {
     const origin = request.headers.get('Origin') || '';
     const isAllowedOrigin = allowedOrigins.includes(origin) || origin.endsWith('.pages.dev');
 
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-KEY",
+    const corsHeaders: Record<string, string> = {
+      'Access-Control-Allow-Origin': isAllowedOrigin ? origin : (allowedOrigins[0] || '*'),
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-KEY',
+      'Access-Control-Max-Age': '86400',
     };
 
     if (method === 'OPTIONS') {
