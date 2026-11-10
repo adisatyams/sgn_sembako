@@ -1,17 +1,17 @@
 {
-  "name": "minyakku-worker-api",
+  "name": "sgn-sembako-worker",
   "version": "1.0.0",
-  "description": "Backend Cloudflare Worker untuk ERP Minyak Goreng",
-  "main": "worker.ts",
+  "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^0.9.0"
+    "pg": "^8.11.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",
+    "@types/pg": "^8.11.6",
     "typescript": "^5.4.0",
     "wrangler": "^3.114.0"
   }

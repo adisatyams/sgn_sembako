@@ -1,21 +1,9 @@
-# Cloudflare Worker Configuration
-name = "minyakku-worker-api"
+name = "sgn-sembako"
 main = "src/index.ts"
 compatibility_date = "2024-04-05"
 compatibility_flags = ["nodejs_compat"]
 account_id = "0fb0eac92e0637fca3c730b55a2812eb"
 
-[vars]
-B2_ENDPOINT = "s3.us-west-002.backblazeb2.com"
-B2_BUCKET_NAME = "sgn-sembako-documents"
-B2_KEY_ID = "002e55ca715c560000000000b"
-WA_SENDER_NUMBER = "6282320379721"
-
-# Opsional: Jika menggunakan Cloudflare R2 bawaan akun Anda
-# R2_ENDPOINT = "https://0fb0eac92e0637fca3c730b55a2812eb.r2.cloudflarestorage.com"
-
-# ...
 [[hyperdrive]]
 binding = "HYPERDRIVE"
-id = "a47a1f52c2a34dd4bfbbfa939ba179c6"
-# ...
+id = "GANTI_DENGAN_ID_HYPERDRIVE"
