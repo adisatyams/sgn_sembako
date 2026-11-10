@@ -1,0 +1,14 @@
+# Cloudflare Worker Configuration
+name = "minyakku-worker-api"
+main = "worker.ts"
+compatibility_date = "2026-11-01"
+
+[vars]
+B2_ENDPOINT = "s3.us-west-004.backblazeb2.com"
+B2_BUCKET_NAME = "minyakku-documents-production"
+WA_SENDER_NUMBER = "6281298765432"
+
+# Aiven PostgreSQL Hyperdrive connection for low-latency edge pooling
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "your-hyperdrive-id"
