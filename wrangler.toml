@@ -4,6 +4,14 @@ compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 account_id = "0fb0eac92e0637fca3c730b55a2812eb"
 
-[[hyperdrive]]
-binding = "HYPERDRIVE"
-id = "a47a1f52c2a34dd4bfbbfa939ba179c6"
+# Database Cloudflare D1 (5 GB Gratis)
+# Cukup buat database di Cloudflare Dashboard > Storage & Databases > D1 SQL Database > Create "minyakku-d1"
+[[d1_databases]]
+binding = "DB"
+database_name = "minyakku-d1"
+database_id = "GANTI_DENGAN_ID_D1_DARI_DASHBOARD"
+
+# Alternatif: Aiven PostgreSQL via Hyperdrive
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "GANTI_DENGAN_ID_HYPERDRIVE"
