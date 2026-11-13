@@ -7,8 +7,9 @@ export interface AuthEnv {
   DB?: any; // Cloudflare D1
   ADMIN_EMAIL?: string; // default: adi.satya.ms@gmail.com
   ADMIN_INITIAL_PASSWORD?: string; // secret, dipakai SEKALI untuk membuat akun saat login pertama
-  RESEND_API_KEY?: string; // secret, untuk mengirim email kode 2FA lewat Resend
-  MAIL_FROM?: string; // contoh: "SGN Sembako <login@domainanda.com>"
+  EMAIL?: any; // binding Cloudflare Email Service (send_email), dipakai lebih dulu bila ada
+  RESEND_API_KEY?: string; // cadangan: kirim lewat Resend bila binding EMAIL tidak ada
+  MAIL_FROM?: string; // alamat pengirim di domain Anda, contoh: login@domainanda.com
   AUTH_PEPPER?: string; // secret opsional, tambahan pengaman hash kode 2FA
 }
 
@@ -184,9 +185,8 @@ async function findOrSeedUser(env: AuthEnv, email: string): Promise<any | null> 
 // ---------- email 2FA ----------
 
 async function sendOtpEmail(env: AuthEnv, to: string, code: string): Promise<void> {
-  if (!env.RESEND_API_KEY) throw new Error('EMAIL_NOT_CONFIGURED');
-  const from = env.MAIL_FROM || 'SGN Sembako <onboarding@resend.dev>';
   const minutes = Math.round(OTP_TTL_MS / 60000);
+  const subject = 'Kode verifikasi login SGN Sembako';
   const text =
     `Kode verifikasi login SGN Sembako Anda: ${code}\n\n` +
     `Kode berlaku ${minutes} menit. Jangan bagikan kode ini kepada siapa pun.\n` +
@@ -200,10 +200,20 @@ async function sendOtpEmail(env: AuthEnv, to: string, code: string): Promise<voi
     `<p style="color:#888;font-size:12px">Jika Anda tidak sedang mencoba login, abaikan email ini dan segera ganti password Anda.</p>` +
     `</div>`;
 
+  // 1) Cloudflare Email Service (binding EMAIL) - tanpa layanan pihak ketiga
+  if (env.EMAIL?.send) {
+    if (!env.MAIL_FROM) throw new Error('EMAIL_NOT_CONFIGURED MAIL_FROM kosong');
+    await env.EMAIL.send({ to, from: env.MAIL_FROM, subject, html, text });
+    return;
+  }
+
+  // 2) Cadangan: Resend
+  if (!env.RESEND_API_KEY) throw new Error('EMAIL_NOT_CONFIGURED');
+  const from = env.MAIL_FROM || 'SGN Sembako <onboarding@resend.dev>';
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from, to: [to], subject: 'Kode verifikasi login SGN Sembako', html, text }),
+    body: JSON.stringify({ from, to: [to], subject, html, text }),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
@@ -215,7 +225,7 @@ function emailErrorResponse(err: any): Response {
   const msg = String(err?.message || '');
   console.error('2FA email error:', msg);
   if (msg.startsWith('EMAIL_NOT_CONFIGURED')) {
-    return json({ error: 'Pengiriman email belum dikonfigurasi di Worker (secret RESEND_API_KEY belum diisi).' }, 503);
+    return json({ error: 'Pengiriman email belum dikonfigurasi di Worker (binding EMAIL + MAIL_FROM, atau secret RESEND_API_KEY, belum diisi).' }, 503);
   }
   return json({ error: 'Gagal mengirim email kode verifikasi. Coba lagi beberapa saat.' }, 502);
 }
