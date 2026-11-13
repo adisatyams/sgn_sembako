@@ -283,9 +283,24 @@ export default {
               warehouse_name TEXT,
               data_json TEXT,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`),
+            env.DB.prepare(`CREATE TABLE IF NOT EXISTS cash_inflows (
+              id TEXT PRIMARY KEY,
+              inflow_date TEXT NOT NULL,
+              inflow_type TEXT NOT NULL,
+              source_name TEXT NOT NULL,
+              description TEXT NOT NULL,
+              principal_amount REAL DEFAULT 0,
+              tenor_months INTEGER DEFAULT 0,
+              annual_interest_rate_pct REAL DEFAULT 0,
+              interest_tax_rate_pct REAL DEFAULT 15,
+              paid_installments INTEGER DEFAULT 0,
+              destination_account TEXT,
+              data_json TEXT,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`)
           ]);
-          return Response.json({ success: true, message: '12 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
+          return Response.json({ success: true, message: '13 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
         }
 
         // Aiven PostgreSQL Fallback
@@ -373,6 +388,7 @@ export default {
             suppliers: 0,
             purchaseOrders: 0,
             operationalExpenses: 0,
+            cashInflows: 0,
           };
 
           // 1. Company Profile
@@ -799,6 +815,40 @@ export default {
             }
           }
 
+          // 13. Cash Inflows & Loans
+          if (Array.isArray(payload.cashInflows)) {
+            for (const ci of payload.cashInflows) {
+              stmts.push(
+                env.DB.prepare(
+                  `INSERT INTO cash_inflows (id, inflow_date, inflow_type, source_name, description, principal_amount, tenor_months, annual_interest_rate_pct, interest_tax_rate_pct, paid_installments, destination_account, data_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                   ON CONFLICT(id) DO UPDATE SET
+                     inflow_date=excluded.inflow_date,
+                     inflow_type=excluded.inflow_type,
+                     source_name=excluded.source_name,
+                     description=excluded.description,
+                     principal_amount=excluded.principal_amount,
+                     paid_installments=excluded.paid_installments,
+                     data_json=excluded.data_json`
+                ).bind(
+                  ci.id,
+                  ci.date || '',
+                  ci.type || 'PINJAMAN_PEMILIK_PT',
+                  ci.sourceName || '',
+                  ci.description || '',
+                  Number(ci.principalAmount) || 0,
+                  Number(ci.tenorMonths) || 0,
+                  Number(ci.annualInterestRatePct) || 0,
+                  Number(ci.interestTaxRatePct) || 15,
+                  Number(ci.paidInstallments) || 0,
+                  ci.destinationAccount || '',
+                  JSON.stringify(ci)
+                )
+              );
+              savedStats.cashInflows++;
+            }
+          }
+
           if (stmts.length > 0) {
             await env.DB.batch(stmts);
           }
@@ -903,10 +953,12 @@ export default {
           let suppliers: any[] = [];
           let purchaseOrders: any[] = [];
           let operationalExpenses: any[] = [];
+          let cashInflows: any[] = [];
           try {
             suppliers = (await env.DB.prepare('SELECT * FROM suppliers ORDER BY created_at ASC').all()).results || [];
             purchaseOrders = (await env.DB.prepare('SELECT * FROM purchase_orders ORDER BY created_at DESC').all()).results || [];
             operationalExpenses = (await env.DB.prepare('SELECT * FROM operational_expenses ORDER BY expense_date DESC').all()).results || [];
+            cashInflows = (await env.DB.prepare('SELECT * FROM cash_inflows ORDER BY inflow_date DESC').all()).results || [];
           } catch {
             // Tabel opsional belum di-init, abaikan agar tetap kompatibel
           }
@@ -927,6 +979,7 @@ export default {
               suppliers: suppliers.map((s: any) => s.data_json ? JSON.parse(s.data_json) : s),
               purchaseOrders: purchaseOrders.map((po: any) => po.data_json ? JSON.parse(po.data_json) : po),
               operationalExpenses: operationalExpenses.map((e: any) => e.data_json ? JSON.parse(e.data_json) : e),
+              cashInflows: cashInflows.map((ci: any) => ci.data_json ? JSON.parse(ci.data_json) : ci),
             }
           }, { headers: corsHeaders });
         }
