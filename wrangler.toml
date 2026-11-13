@@ -11,14 +11,17 @@ binding = "DB"
 database_name = "minyakku-d1"
 database_id = "c5c5d38c-c4d9-401f-929c-0c32940592e2"
 
-# Kirim email kode 2FA lewat Cloudflare Email Service (domain harus sudah di Cloudflare + Email Service)
-[[send_email]]
-name = "EMAIL"
-allowed_destination_addresses = ["adi.satya.ms@gmail.com"]
+# Email kode 2FA: default lewat Google Apps Script (lihat AUTH.md)
+# (berbayar, nonaktif secara default) aktifkan bila memakai Cloudflare Email Service:
+# [[send_email]]
+# name = "EMAIL"
+# allowed_destination_addresses = ["adi.satya.ms@gmail.com"]
 
 # Secret untuk login + 2FA (isi dengan: npx wrangler secret put NAMA_SECRET)
 #   ADMIN_INITIAL_PASSWORD  password awal admin (dipakai sekali saat login pertama)
 #   RESEND_API_KEY          (cadangan, opsional) API key Resend bila tidak pakai binding EMAIL
+#   MAIL_WEBHOOK_URL        URL web app Google Apps Script (lihat AUTH.md)
+#   MAIL_WEBHOOK_SECRET     secret bersama dengan script tsb
 #   MAIL_FROM               wajib untuk binding EMAIL: alamat pengirim, contoh login@domainanda.com (bisa juga sebagai variabel biasa)
 #   AUTH_PEPPER             (opsional) string acak panjang untuk memperkuat hash kode 2FA
 # Variabel biasa (opsional): ADMIN_EMAIL, default adi.satya.ms@gmail.com

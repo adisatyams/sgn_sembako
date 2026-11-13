@@ -7,7 +7,14 @@ Hanya `/`, `/health`, `/api/health` yang tetap publik.
 
 ## Setup (sekali saja)
 
-1. Daftar di https://resend.com memakai email **adi.satya.ms@gmail.com**, lalu buat API key.
+1. **Email 2FA lewat Gmail sendiri (gratis, tanpa domain)** - Google Apps Script:
+   - Buka https://script.google.com (login adi.satya.ms@gmail.com) > Proyek baru, tempel `docs/mail-webhook.gs`.
+   - Project Settings > Script Properties > tambah `SECRET` = string acak panjang.
+   - Deploy > New deployment > Web app: *Execute as: Me*, *Who has access: Anyone*. Salin URL-nya.
+   - Di worker isi `MAIL_WEBHOOK_URL` (URL tadi) dan `MAIL_WEBHOOK_SECRET` (sama dengan `SECRET`).
+   Alternatif: Resend (langkah di bawah) atau Cloudflare Email Service (berbayar).
+
+   (Opsional) Resend: daftar di https://resend.com memakai email **adi.satya.ms@gmail.com**, lalu buat API key.
    Tanpa domain terverifikasi, Resend hanya mengizinkan kirim ke email pemilik akunnya
    (cukup untuk kasus ini). Jika nanti pakai domain sendiri, set `MAIL_FROM`.
 2. Isi secret di Worker:

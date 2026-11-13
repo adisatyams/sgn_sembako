@@ -8,6 +8,8 @@ export interface AuthEnv {
   ADMIN_EMAIL?: string; // default: adi.satya.ms@gmail.com
   ADMIN_INITIAL_PASSWORD?: string; // secret, dipakai SEKALI untuk membuat akun saat login pertama
   EMAIL?: any; // binding Cloudflare Email Service (send_email), dipakai lebih dulu bila ada
+  MAIL_WEBHOOK_URL?: string; // URL web app Google Apps Script (kirim lewat Gmail sendiri, gratis)
+  MAIL_WEBHOOK_SECRET?: string; // secret bersama untuk web app tersebut
   RESEND_API_KEY?: string; // cadangan: kirim lewat Resend bila binding EMAIL tidak ada
   MAIL_FROM?: string; // alamat pengirim di domain Anda, contoh: login@domainanda.com
   AUTH_PEPPER?: string; // secret opsional, tambahan pengaman hash kode 2FA
@@ -207,7 +209,20 @@ async function sendOtpEmail(env: AuthEnv, to: string, code: string): Promise<voi
     return;
   }
 
-  // 2) Cadangan: Resend
+  // 2) Google Apps Script (Gmail sendiri) - gratis, tanpa domain
+  if (env.MAIL_WEBHOOK_URL) {
+    const res = await fetch(env.MAIL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ secret: env.MAIL_WEBHOOK_SECRET || '', to, subject, text, html }),
+      redirect: 'follow',
+    });
+    const reply = (await res.text().catch(() => '')).trim();
+    if (!res.ok || reply !== 'ok') throw new Error(`EMAIL_SEND_FAILED webhook ${res.status} ${reply.slice(0, 120)}`);
+    return;
+  }
+
+  // 3) Cadangan: Resend
   if (!env.RESEND_API_KEY) throw new Error('EMAIL_NOT_CONFIGURED');
   const from = env.MAIL_FROM || 'SGN Sembako <onboarding@resend.dev>';
   const res = await fetch('https://api.resend.com/emails', {
