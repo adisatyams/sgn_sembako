@@ -1039,12 +1039,93 @@ export default {
       // 4. Tarik Seluruh Data dari Database (D1 atau Aiven)
       if ((pathname === '/api/d1/all' || pathname === '/api/sync/pull') && method === 'GET') {
         if (env.DB) {
+          const safeJson = (val: any, fallback: any = null) => {
+            if (!val) return fallback;
+            if (typeof val === 'object') return val;
+            try {
+              return JSON.parse(String(val));
+            } catch {
+              return fallback;
+            }
+          };
+
+          const normalizeCustomer = (row: any) => {
+            const parsed = safeJson(row.data_json, {}) || {};
+            const code = parsed.code || row.code || `CUST-BOT-${String(row.id || '').slice(0, 6)}`;
+            return {
+              ...parsed,
+              id: parsed.id || row.id || code,
+              code,
+              name: row.name || parsed.name || 'Pelanggan Baru',
+              companyOrShopName: parsed.companyOrShopName || row.company_name || parsed.companyName || row.name || '',
+              tier: row.tier || parsed.tier || 'END_USER',
+              phone: row.phone || parsed.phone || '-',
+              email: row.email ?? parsed.email ?? '',
+              address: row.address || parsed.address || '-',
+              city: row.city ?? parsed.city ?? '',
+              isPkp: parsed.isPkp !== undefined ? Boolean(parsed.isPkp) : Boolean(row.is_pkp),
+              npwp: row.npwp ?? parsed.npwp ?? '',
+              nik: row.nik ?? parsed.nik ?? '',
+              creditLimit: Number(parsed.creditLimit ?? row.credit_limit ?? 0),
+              currentReceivable: Number(parsed.currentReceivable ?? row.current_receivable ?? 0),
+              paymentTerms: row.payment_terms || parsed.paymentTerms || 'CASH_BEFORE_DELIVERY',
+              bankAccounts: Array.isArray(parsed.bankAccounts) ? parsed.bankAccounts : [],
+              notes: row.notes ?? parsed.notes ?? 'Tersinkron dari Cloudflare D1',
+              createdAt: parsed.createdAt || (row.created_at ? String(row.created_at).slice(0, 10) : new Date().toISOString().split('T')[0]),
+            };
+          };
+
+          const normalizeOrder = (row: any) => {
+            const parsed = safeJson(row.data_json, {}) || {};
+            const parsedItems = safeJson(row.items_json, null);
+            const items = Array.isArray(parsed.items)
+              ? parsed.items
+              : Array.isArray(parsedItems)
+              ? parsedItems
+              : [];
+            const subtotalDpp = Number(parsed.subtotalDpp ?? row.subtotal_dpp ?? 0);
+            const ppnAmount = Number(parsed.ppnAmount ?? row.ppn_amount ?? 0);
+            const grandTotal = Number(parsed.grandTotal ?? row.grand_total ?? subtotalDpp + ppnAmount);
+            const orderDate =
+              parsed.date ||
+              row.order_date ||
+              (row.created_at ? String(row.created_at).slice(0, 10) : new Date().toISOString().split('T')[0]);
+            const orderNumber = parsed.orderNumber || row.order_number || `SO-D1-${String(row.id || '').slice(0, 8)}`;
+
+            return {
+              ...parsed,
+              id: parsed.id || row.id || orderNumber,
+              orderNumber,
+              date: orderDate,
+              customerId: parsed.customerId || row.customer_id || '',
+              customerName: row.customer_name || parsed.customerName || 'Pelanggan Chatbot',
+              customerTier: row.customer_tier || parsed.customerTier || 'END_USER',
+              customerPhone: parsed.customerPhone || row.customer_phone || '-',
+              shippingAddress: parsed.shippingAddress || row.shipping_address || '-',
+              warehouseId: parsed.warehouseId || row.warehouse_id || '',
+              warehouseName: parsed.warehouseName || row.warehouse_name || 'Gudang Utama',
+              salesPerson: row.sales_person || parsed.salesPerson || 'Chatbot / D1',
+              items,
+              subtotalDpp,
+              isPkpApplied: parsed.isPkpApplied !== undefined ? Boolean(parsed.isPkpApplied) : ppnAmount > 0,
+              ppnAmount,
+              pph22Amount: Number(parsed.pph22Amount ?? 0),
+              grandTotal,
+              negotiationStatus: row.negotiation_status || parsed.negotiationStatus || 'NOT_NEEDED',
+              negotiationLogs: Array.isArray(parsed.negotiationLogs) ? parsed.negotiationLogs : [],
+              paymentStatus: row.payment_status || parsed.paymentStatus || 'UNPAID',
+              paymentMethod: row.payment_method || parsed.paymentMethod || 'MANUAL_TRANSFER',
+              dispatchStatus: row.dispatch_status || parsed.dispatchStatus || 'READY_TO_DISPATCH',
+              notes: row.notes ?? parsed.notes ?? '',
+            };
+          };
+
           const companyRes = (await env.DB.prepare('SELECT * FROM company_profiles LIMIT 1').all()).results || [];
-          const customers = (await env.DB.prepare('SELECT * FROM customers ORDER BY created_at ASC').all()).results || [];
-          const resellers = (await env.DB.prepare('SELECT * FROM resellers ORDER BY created_at ASC').all()).results || [];
+          const customers = (await env.DB.prepare('SELECT * FROM customers ORDER BY created_at DESC').all()).results || [];
+          const resellers = (await env.DB.prepare('SELECT * FROM resellers ORDER BY created_at DESC').all()).results || [];
           const warehouses = (await env.DB.prepare('SELECT * FROM warehouses ORDER BY created_at ASC').all()).results || [];
           const products = (await env.DB.prepare('SELECT * FROM products ORDER BY created_at ASC').all()).results || [];
-          const stockBatches = (await env.DB.prepare('SELECT * FROM stock_batches ORDER BY created_at ASC').all()).results || [];
+          const stockBatches = (await env.DB.prepare('SELECT * FROM stock_batches ORDER BY created_at DESC').all()).results || [];
           const salesOrders = (await env.DB.prepare('SELECT * FROM sales_orders ORDER BY created_at DESC').all()).results || [];
           const suratJalanList = (await env.DB.prepare('SELECT * FROM surat_jalan ORDER BY created_at DESC').all()).results || [];
           const invoices = (await env.DB.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all()).results || [];
@@ -1068,24 +1149,25 @@ export default {
           return Response.json({
             success: true,
             database: 'Cloudflare D1 SQLite (5GB Gratis)',
+            timestamp: new Date().toISOString(),
             data: {
-              company: companyRes[0]?.data_json ? JSON.parse(companyRes[0].data_json) : companyRes[0] || null,
-              customers: customers.map((c: any) => c.data_json ? JSON.parse(c.data_json) : c),
-              resellers: resellers.map((r: any) => r.data_json ? JSON.parse(r.data_json) : r),
-              warehouses: warehouses.map((w: any) => w.data_json ? JSON.parse(w.data_json) : w),
-              products: products.map((p: any) => p.data_json ? JSON.parse(p.data_json) : p),
-              stockBatches: stockBatches.map((b: any) => b.data_json ? JSON.parse(b.data_json) : b),
-              salesOrders: salesOrders.map((o: any) => o.data_json ? JSON.parse(o.data_json) : o),
-              suratJalanList: suratJalanList.map((sj: any) => sj.data_json ? JSON.parse(sj.data_json) : sj),
-              invoices: invoices.map((inv: any) => inv.data_json ? JSON.parse(inv.data_json) : inv),
-              suppliers: suppliers.map((s: any) => s.data_json ? JSON.parse(s.data_json) : s),
-              purchaseOrders: purchaseOrders.map((po: any) => po.data_json ? JSON.parse(po.data_json) : po),
-              operationalExpenses: operationalExpenses.map((e: any) => e.data_json ? JSON.parse(e.data_json) : e),
-              cashInflows: cashInflows.map((ci: any) => ci.data_json ? JSON.parse(ci.data_json) : ci),
-              employees: employees.map((emp: any) => emp.data_json ? JSON.parse(emp.data_json) : emp),
-              payrollRecords: payrollRecords.map((pr: any) => pr.data_json ? JSON.parse(pr.data_json) : pr),
+              company: companyRes[0]?.data_json ? safeJson(companyRes[0].data_json, companyRes[0]) : companyRes[0] || null,
+              customers: customers.map(normalizeCustomer),
+              resellers: resellers.map((r: any) => safeJson(r.data_json, r)),
+              warehouses: warehouses.map((w: any) => safeJson(w.data_json, w)),
+              products: products.map((p: any) => safeJson(p.data_json, p)),
+              stockBatches: stockBatches.map((b: any) => safeJson(b.data_json, b)),
+              salesOrders: salesOrders.map(normalizeOrder),
+              suratJalanList: suratJalanList.map((sj: any) => safeJson(sj.data_json, sj)),
+              invoices: invoices.map((inv: any) => safeJson(inv.data_json, inv)),
+              suppliers: suppliers.map((s: any) => safeJson(s.data_json, s)),
+              purchaseOrders: purchaseOrders.map((po: any) => safeJson(po.data_json, po)),
+              operationalExpenses: operationalExpenses.map((e: any) => safeJson(e.data_json, e)),
+              cashInflows: cashInflows.map((ci: any) => safeJson(ci.data_json, ci)),
+              employees: employees.map((emp: any) => safeJson(emp.data_json, emp)),
+              payrollRecords: payrollRecords.map((pr: any) => safeJson(pr.data_json, pr)),
             }
-          }, { headers: corsHeaders });
+          }, { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } });
         }
 
         if (env.HYPERDRIVE || env.DATABASE_URL) {
