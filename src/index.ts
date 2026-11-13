@@ -11,6 +11,10 @@ export interface Env {
   B2_ENDPOINT?: string;
   B2_BUCKET_NAME?: string;
   WA_API_KEY?: string;
+  SIPAJAK_ENV?: string;
+  SIPAJAK_NPWP?: string;
+  SIPAJAK_USERNAME?: string;
+  SIPAJAK_PASSWORD?: string;
 }
 
 function getDbClient(env: Env): Client {
@@ -1006,6 +1010,130 @@ export default {
         }
 
         return Response.json({ success: false, message: 'Database belum terkonfigurasi' }, { status: 400, headers: corsHeaders });
+      }
+
+      // 5. SiPajak PJAP Resmi DJP (Host-to-Host Coretax Proxy)
+      if (pathname.startsWith('/api/sipajak/')) {
+        const envMode = (env.SIPAJAK_ENV || 'staging').toLowerCase() === 'production' ? 'production' : 'staging';
+        const baseUrl =
+          envMode === 'production'
+            ? 'https://gateway-integration.sipajak.com'
+            : 'https://staging-gateway-integration.sipajak.com';
+        const username = env.SIPAJAK_USERNAME || '';
+        const password = env.SIPAJAK_PASSWORD || '';
+
+        if (pathname === '/api/sipajak/status' && method === 'GET') {
+          const npwp = (env.SIPAJAK_NPWP || '').replace(/[^0-9]/g, '');
+          return Response.json({
+            configured: Boolean(username && password && npwp),
+            environment: envMode,
+            baseUrl,
+            npwp,
+          }, { headers: corsHeaders });
+        }
+
+        const body: any = method === 'POST' ? await request.json().catch(() => ({})) : {};
+        const npwp = (env.SIPAJAK_NPWP || body?.sellerNpwp || '').replace(/[^0-9]/g, '');
+        if (!username || !password || !npwp) {
+          return Response.json({
+            success: false,
+            configured: false,
+            status: 'NOT_CONFIGURED',
+            valid: false,
+            message: 'Kredensial Worker SiPajak belum diset (wrangler secret put SIPAJAK_USERNAME / SIPAJAK_PASSWORD / SIPAJAK_NPWP). Daftar di https://www.sipajak.com/#harga.',
+          }, { headers: corsHeaders });
+        }
+
+        const spHeaders = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Basic ${btoa(`${username}:${password}`)}`,
+          npwp,
+        };
+
+        if (pathname === '/api/sipajak/efaktur/create' && method === 'POST') {
+          const upstream = await fetch(`${baseUrl}/v2/efaktur/create-faktur-pk`, {
+            method: 'POST',
+            headers: spHeaders,
+            body: JSON.stringify(body.payload || {}),
+          });
+          const parsed: any = await upstream.json().catch(() => ({}));
+          const ok = upstream.ok && (String(parsed?.data?.status ?? '') === '1' || parsed?.success === true);
+          return Response.json({
+            success: ok,
+            configured: true,
+            status: ok ? (envMode === 'production' ? 'APPROVED_DJP' : 'STAGING_SENT') : 'REJECTED_DJP',
+            fakturPajakNumber: parsed?.data?.nomorFaktur || body?.payload?.nomorFaktur,
+            uuid: parsed?.data?.uuid || parsed?.data?.id,
+            message: parsed?.data?.statusMessage || parsed?.message || (ok ? 'Terkirim ke SiPajak.' : `HTTP ${upstream.status}`),
+            rawResponse: parsed,
+          }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/sipajak/vswp' && method === 'POST') {
+          const upstream = await fetch(`${baseUrl}/v2/vswp`, {
+            method: 'POST',
+            headers: spHeaders,
+            body: JSON.stringify({ npwp: body.targetNpwpOrNik || '' }),
+          });
+          const parsed: any = await upstream.json().catch(() => ({}));
+          const ok = upstream.ok && String(parsed?.data?.status ?? '0') === '1';
+          return Response.json({
+            success: ok,
+            configured: true,
+            valid: ok,
+            name: parsed?.data?.nama || parsed?.data?.name,
+            statusWp: parsed?.data?.statusWp || parsed?.data?.statusMessage,
+            message: parsed?.data?.statusMessage || (ok ? 'NPWP/NIK valid di DJP.' : 'Validasi DJP tidak cocok.'),
+          }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/sipajak/ebupot/create' && method === 'POST') {
+          const upstream = await fetch(`${baseUrl}/v2/ebupot/unifikasi/create`, {
+            method: 'POST',
+            headers: spHeaders,
+            body: JSON.stringify(body.bupot || {}),
+          });
+          const parsed: any = await upstream.json().catch(() => ({}));
+          const ok = upstream.ok && String(parsed?.data?.status ?? '0') === '1';
+          return Response.json({
+            success: ok,
+            configured: true,
+            bupotNumber: parsed?.data?.noBupot || parsed?.data?.nomorBuktiPotong,
+            message: parsed?.data?.statusMessage || parsed?.message || (ok ? 'e-Bupot terkirim.' : 'Gagal membuat e-Bupot.'),
+          }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/sipajak/ebilling/create' && method === 'POST') {
+          const upstream = await fetch(`${baseUrl}/v2/ebilling/create`, {
+            method: 'POST',
+            headers: spHeaders,
+            body: JSON.stringify({
+              npwp,
+              kap: body?.billing?.kap,
+              kjs: body?.billing?.kjs,
+              masaPajak: body?.billing?.masaPajak,
+              tahunPajak: body?.billing?.tahunPajak,
+              jumlahBayar: body?.billing?.amount,
+              uraian: body?.billing?.description,
+            }),
+          });
+          const parsed: any = await upstream.json().catch(() => ({}));
+          if (upstream.ok && (parsed?.data?.idBilling || parsed?.data?.kodeBilling)) {
+            return Response.json({
+              success: true,
+              configured: true,
+              billingCode: parsed?.data?.idBilling || parsed?.data?.kodeBilling,
+              expiredAt: parsed?.data?.masaAktif || parsed?.data?.expiredAt,
+              message: 'ID Billing 15 digit DJP berhasil dibuat via SiPajak.',
+            }, { headers: corsHeaders });
+          }
+          return Response.json({
+            success: false,
+            configured: true,
+            message: parsed?.message || parsed?.data?.statusMessage || `HTTP ${upstream.status}`,
+          }, { headers: corsHeaders });
+        }
       }
 
       return new Response('Not Found', { status: 404, headers: corsHeaders });
