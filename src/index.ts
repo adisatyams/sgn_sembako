@@ -302,9 +302,37 @@ export default {
               destination_account TEXT,
               data_json TEXT,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`),
+            env.DB.prepare(`CREATE TABLE IF NOT EXISTS employees (
+              id TEXT PRIMARY KEY,
+              code TEXT UNIQUE NOT NULL,
+              name TEXT NOT NULL,
+              role_title TEXT NOT NULL,
+              department TEXT,
+              payroll_scheme TEXT NOT NULL,
+              ptkp_status TEXT NOT NULL,
+              npwp_or_nik TEXT,
+              base_salary REAL DEFAULT 0,
+              fixed_allowance REAL DEFAULT 0,
+              status TEXT DEFAULT 'ACTIVE',
+              data_json TEXT,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`),
+            env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_records (
+              id TEXT PRIMARY KEY,
+              period_month TEXT NOT NULL,
+              pay_date TEXT NOT NULL,
+              employee_id TEXT NOT NULL,
+              employee_name TEXT NOT NULL,
+              payroll_scheme TEXT NOT NULL,
+              gross_pay REAL DEFAULT 0,
+              pph21_amount REAL DEFAULT 0,
+              net_take_home_pay REAL DEFAULT 0,
+              data_json TEXT,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`)
           ]);
-          return Response.json({ success: true, message: '13 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
+          return Response.json({ success: true, message: '15 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
         }
 
         // Aiven PostgreSQL Fallback
@@ -393,6 +421,8 @@ export default {
             purchaseOrders: 0,
             operationalExpenses: 0,
             cashInflows: 0,
+            employees: 0,
+            payrollRecords: 0,
           };
 
           // 1. Company Profile
@@ -853,6 +883,70 @@ export default {
             }
           }
 
+          // 14. Employees
+          if (Array.isArray(payload.employees)) {
+            for (const emp of payload.employees) {
+              stmts.push(
+                env.DB.prepare(
+                  `INSERT INTO employees (id, code, name, role_title, department, payroll_scheme, ptkp_status, npwp_or_nik, base_salary, fixed_allowance, status, data_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                   ON CONFLICT(code) DO UPDATE SET
+                     name=excluded.name,
+                     role_title=excluded.role_title,
+                     payroll_scheme=excluded.payroll_scheme,
+                     ptkp_status=excluded.ptkp_status,
+                     base_salary=excluded.base_salary,
+                     fixed_allowance=excluded.fixed_allowance,
+                     status=excluded.status,
+                     data_json=excluded.data_json`
+                ).bind(
+                  emp.id || emp.code,
+                  emp.code,
+                  emp.name || '',
+                  emp.roleTitle || '',
+                  emp.department || '',
+                  emp.payrollScheme || 'BULANAN_UMR',
+                  emp.ptkpStatus || 'TK/0',
+                  emp.npwpOrNik || '',
+                  Number(emp.baseSalary) || 0,
+                  Number(emp.fixedAllowance) || 0,
+                  emp.status || 'ACTIVE',
+                  JSON.stringify(emp)
+                )
+              );
+              savedStats.employees++;
+            }
+          }
+
+          // 15. Payroll Records
+          if (Array.isArray(payload.payrollRecords)) {
+            for (const pr of payload.payrollRecords) {
+              stmts.push(
+                env.DB.prepare(
+                  `INSERT INTO payroll_records (id, period_month, pay_date, employee_id, employee_name, payroll_scheme, gross_pay, pph21_amount, net_take_home_pay, data_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                   ON CONFLICT(id) DO UPDATE SET
+                     gross_pay=excluded.gross_pay,
+                     pph21_amount=excluded.pph21_amount,
+                     net_take_home_pay=excluded.net_take_home_pay,
+                     data_json=excluded.data_json`
+                ).bind(
+                  pr.id,
+                  pr.periodMonth || '',
+                  pr.payDate || '',
+                  pr.employeeId || '',
+                  pr.employeeName || '',
+                  pr.payrollScheme || 'BULANAN_UMR',
+                  Number(pr.grossPay) || 0,
+                  Number(pr.pph21Amount) || 0,
+                  Number(pr.netTakeHomePay) || 0,
+                  JSON.stringify(pr)
+                )
+              );
+              savedStats.payrollRecords++;
+            }
+          }
+
           if (stmts.length > 0) {
             await env.DB.batch(stmts);
           }
@@ -860,7 +954,7 @@ export default {
           return Response.json({
             success: true,
             database: 'Cloudflare D1 SQLite (5GB Gratis)',
-            message: `Seluruh 11 tabel berhasil disinkronkan ke Cloudflare D1! (${savedStats.salesOrders} pesanan penjualan, ${savedStats.purchaseOrders} PO suplier, ${savedStats.invoices} faktur, ${savedStats.suppliers} suplier)`,
+            message: `Seluruh 15 tabel berhasil disinkronkan ke Cloudflare D1! (${savedStats.salesOrders} pesanan penjualan, ${savedStats.purchaseOrders} PO suplier, ${savedStats.invoices} faktur, ${savedStats.employees} karyawan, ${savedStats.payrollRecords} slip gaji)`,
             stats: savedStats,
             timestamp: new Date().toISOString()
           }, { headers: corsHeaders });
@@ -958,11 +1052,15 @@ export default {
           let purchaseOrders: any[] = [];
           let operationalExpenses: any[] = [];
           let cashInflows: any[] = [];
+          let employees: any[] = [];
+          let payrollRecords: any[] = [];
           try {
             suppliers = (await env.DB.prepare('SELECT * FROM suppliers ORDER BY created_at ASC').all()).results || [];
             purchaseOrders = (await env.DB.prepare('SELECT * FROM purchase_orders ORDER BY created_at DESC').all()).results || [];
             operationalExpenses = (await env.DB.prepare('SELECT * FROM operational_expenses ORDER BY expense_date DESC').all()).results || [];
             cashInflows = (await env.DB.prepare('SELECT * FROM cash_inflows ORDER BY inflow_date DESC').all()).results || [];
+            employees = (await env.DB.prepare('SELECT * FROM employees ORDER BY created_at ASC').all()).results || [];
+            payrollRecords = (await env.DB.prepare('SELECT * FROM payroll_records ORDER BY pay_date DESC').all()).results || [];
           } catch {
             // Tabel opsional belum di-init, abaikan agar tetap kompatibel
           }
@@ -984,6 +1082,8 @@ export default {
               purchaseOrders: purchaseOrders.map((po: any) => po.data_json ? JSON.parse(po.data_json) : po),
               operationalExpenses: operationalExpenses.map((e: any) => e.data_json ? JSON.parse(e.data_json) : e),
               cashInflows: cashInflows.map((ci: any) => ci.data_json ? JSON.parse(ci.data_json) : ci),
+              employees: employees.map((emp: any) => emp.data_json ? JSON.parse(emp.data_json) : emp),
+              payrollRecords: payrollRecords.map((pr: any) => pr.data_json ? JSON.parse(pr.data_json) : pr),
             }
           }, { headers: corsHeaders });
         }
