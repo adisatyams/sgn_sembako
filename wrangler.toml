@@ -1,5 +1,5 @@
 name = "sgn-sembako"
-main = "src/index.ts"
+main = "src/worker.ts" # login + 2FA di depan API (src/index.ts)
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 account_id = "0fb0eac92e0637fca3c730b55a2812eb"
@@ -10,3 +10,10 @@ account_id = "0fb0eac92e0637fca3c730b55a2812eb"
 binding = "DB"
 database_name = "minyakku-d1"
 database_id = "c5c5d38c-c4d9-401f-929c-0c32940592e2"
+
+# Secret untuk login + 2FA (isi dengan: npx wrangler secret put NAMA_SECRET)
+#   ADMIN_INITIAL_PASSWORD  password awal admin (dipakai sekali saat login pertama)
+#   RESEND_API_KEY          API key Resend untuk mengirim email kode 2FA
+#   MAIL_FROM               (opsional) pengirim email, contoh: SGN Sembako <login@domainanda.com>
+#   AUTH_PEPPER             (opsional) string acak panjang untuk memperkuat hash kode 2FA
+# Variabel biasa (opsional): ADMIN_EMAIL, default adi.satya.ms@gmail.com
