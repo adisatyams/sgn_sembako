@@ -226,9 +226,54 @@ export default {
               faktur_pajak_number TEXT,
               data_json TEXT,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`),
+            env.DB.prepare(`CREATE TABLE IF NOT EXISTS suppliers (
+              id TEXT PRIMARY KEY,
+              code TEXT UNIQUE NOT NULL,
+              name TEXT NOT NULL,
+              brand_names TEXT,
+              is_pkp INTEGER DEFAULT 1,
+              npwp TEXT NOT NULL,
+              nib TEXT,
+              phone TEXT NOT NULL,
+              email TEXT,
+              pic_name TEXT NOT NULL,
+              pic_phone TEXT NOT NULL,
+              address TEXT NOT NULL,
+              city TEXT,
+              payment_terms TEXT DEFAULT 'TOP_14',
+              status TEXT DEFAULT 'ACTIVE',
+              data_json TEXT,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`),
+            env.DB.prepare(`CREATE TABLE IF NOT EXISTS purchase_orders (
+              id TEXT PRIMARY KEY,
+              po_number TEXT UNIQUE NOT NULL,
+              order_date TEXT NOT NULL,
+              expected_delivery_date TEXT,
+              supplier_id TEXT NOT NULL,
+              supplier_name TEXT NOT NULL,
+              supplier_npwp TEXT,
+              target_warehouse_id TEXT NOT NULL,
+              target_warehouse_name TEXT NOT NULL,
+              subtotal_dpp REAL DEFAULT 0,
+              ppn_amount REAL DEFAULT 0,
+              pph22_amount REAL DEFAULT 0,
+              grand_total REAL DEFAULT 0,
+              payment_status TEXT DEFAULT 'UNPAID',
+              delivery_status TEXT DEFAULT 'ORDERED',
+              faktur_pajak_number TEXT,
+              faktur_pajak_date TEXT,
+              faktur_pajak_file_url TEXT,
+              drive_file_id TEXT,
+              drive_web_view_link TEXT,
+              items_json TEXT,
+              data_json TEXT,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              received_at DATETIME
             )`)
           ]);
-          return Response.json({ success: true, message: '9 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
+          return Response.json({ success: true, message: '11 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
         }
 
         // Aiven PostgreSQL Fallback
@@ -313,6 +358,8 @@ export default {
             salesOrders: 0,
             suratJalan: 0,
             invoices: 0,
+            suppliers: 0,
+            purchaseOrders: 0,
           };
 
           // 1. Company Profile
@@ -628,6 +675,87 @@ export default {
             }
           }
 
+          // 10. Suppliers
+          if (Array.isArray(payload.suppliers)) {
+            for (const s of payload.suppliers) {
+              stmts.push(
+                env.DB.prepare(
+                  `INSERT INTO suppliers (id, code, name, brand_names, is_pkp, npwp, nib, phone, email, pic_name, pic_phone, address, city, payment_terms, status, data_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                   ON CONFLICT(code) DO UPDATE SET 
+                     name=excluded.name,
+                     brand_names=excluded.brand_names,
+                     npwp=excluded.npwp,
+                     phone=excluded.phone,
+                     pic_name=excluded.pic_name,
+                     data_json=excluded.data_json`
+                ).bind(
+                  s.id || s.code,
+                  s.code,
+                  s.name,
+                  s.brandNames || '',
+                  s.isPkp ? 1 : 0,
+                  s.npwp,
+                  s.nib || '',
+                  s.phone || '',
+                  s.email || '',
+                  s.picName || '',
+                  s.picPhone || '',
+                  s.address || '',
+                  s.city || '',
+                  s.paymentTerms || 'TOP_14',
+                  s.status || 'ACTIVE',
+                  JSON.stringify(s)
+                )
+              );
+              savedStats.suppliers++;
+            }
+          }
+
+          // 11. Purchase Orders
+          if (Array.isArray(payload.purchaseOrders)) {
+            for (const po of payload.purchaseOrders) {
+              stmts.push(
+                env.DB.prepare(
+                  `INSERT INTO purchase_orders (id, po_number, order_date, expected_delivery_date, supplier_id, supplier_name, supplier_npwp, target_warehouse_id, target_warehouse_name, subtotal_dpp, ppn_amount, pph22_amount, grand_total, payment_status, delivery_status, faktur_pajak_number, faktur_pajak_date, faktur_pajak_file_url, drive_file_id, drive_web_view_link, items_json, data_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                   ON CONFLICT(po_number) DO UPDATE SET 
+                     payment_status=excluded.payment_status,
+                     delivery_status=excluded.delivery_status,
+                     faktur_pajak_number=excluded.faktur_pajak_number,
+                     faktur_pajak_file_url=excluded.faktur_pajak_file_url,
+                     drive_file_id=excluded.drive_file_id,
+                     drive_web_view_link=excluded.drive_web_view_link,
+                     data_json=excluded.data_json`
+                ).bind(
+                  po.id || po.poNumber,
+                  po.poNumber,
+                  po.orderDate || '',
+                  po.expectedDeliveryDate || '',
+                  po.supplierId || '',
+                  po.supplierName || '',
+                  po.supplierNpwp || '',
+                  po.targetWarehouseId || '',
+                  po.targetWarehouseName || '',
+                  Number(po.subtotalDpp) || 0,
+                  Number(po.ppnAmount) || 0,
+                  Number(po.pph22Amount) || 0,
+                  Number(po.grandTotal) || 0,
+                  po.paymentStatus || 'UNPAID',
+                  po.deliveryStatus || 'ORDERED',
+                  po.fakturPajakNumber || '',
+                  po.fakturPajakDate || '',
+                  po.fakturPajakFileUrl || '',
+                  po.fakturPajakDriveFileId || '',
+                  po.fakturPajakDriveWebViewLink || '',
+                  JSON.stringify(po.items || []),
+                  JSON.stringify(po)
+                )
+              );
+              savedStats.purchaseOrders++;
+            }
+          }
+
           if (stmts.length > 0) {
             await env.DB.batch(stmts);
           }
@@ -635,7 +763,7 @@ export default {
           return Response.json({
             success: true,
             database: 'Cloudflare D1 SQLite (5GB Gratis)',
-            message: `Seluruh 9 tabel berhasil disinkronkan ke Cloudflare D1! (${savedStats.salesOrders} pesanan, ${savedStats.invoices} faktur, ${savedStats.products} produk, ${savedStats.customers} pelanggan)`,
+            message: `Seluruh 11 tabel berhasil disinkronkan ke Cloudflare D1! (${savedStats.salesOrders} pesanan penjualan, ${savedStats.purchaseOrders} PO suplier, ${savedStats.invoices} faktur, ${savedStats.suppliers} suplier)`,
             stats: savedStats,
             timestamp: new Date().toISOString()
           }, { headers: corsHeaders });
