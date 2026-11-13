@@ -857,6 +857,14 @@ export default {
           const salesOrders = (await env.DB.prepare('SELECT * FROM sales_orders ORDER BY created_at DESC').all()).results || [];
           const suratJalanList = (await env.DB.prepare('SELECT * FROM surat_jalan ORDER BY created_at DESC').all()).results || [];
           const invoices = (await env.DB.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all()).results || [];
+          let suppliers: any[] = [];
+          let purchaseOrders: any[] = [];
+          try {
+            suppliers = (await env.DB.prepare('SELECT * FROM suppliers ORDER BY created_at ASC').all()).results || [];
+            purchaseOrders = (await env.DB.prepare('SELECT * FROM purchase_orders ORDER BY created_at DESC').all()).results || [];
+          } catch {
+            // Tabel suppliers/purchase_orders belum di-init, abaikan agar tetap kompatibel
+          }
 
           return Response.json({
             success: true,
@@ -871,6 +879,8 @@ export default {
               salesOrders: salesOrders.map((o: any) => o.data_json ? JSON.parse(o.data_json) : o),
               suratJalanList: suratJalanList.map((sj: any) => sj.data_json ? JSON.parse(sj.data_json) : sj),
               invoices: invoices.map((inv: any) => inv.data_json ? JSON.parse(inv.data_json) : inv),
+              suppliers: suppliers.map((s: any) => s.data_json ? JSON.parse(s.data_json) : s),
+              purchaseOrders: purchaseOrders.map((po: any) => po.data_json ? JSON.parse(po.data_json) : po),
             }
           }, { headers: corsHeaders });
         }
