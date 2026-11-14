@@ -192,6 +192,8 @@ export default {
               subtotal_dpp REAL DEFAULT 0,
               ppn_amount REAL DEFAULT 0,
               grand_total REAL DEFAULT 0,
+              payment_unique_code INTEGER DEFAULT 0,
+              unique_transfer_amount REAL DEFAULT 0,
               negotiation_status TEXT DEFAULT 'NOT_NEEDED',
               payment_status TEXT DEFAULT 'UNPAID',
               payment_method TEXT DEFAULT 'MANUAL_TRANSFER',
@@ -332,6 +334,13 @@ export default {
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`)
           ]);
+          // Migrasi aman untuk tabel D1 eksisting
+          try {
+            await env.DB.prepare('ALTER TABLE sales_orders ADD COLUMN payment_unique_code INTEGER DEFAULT 0').run();
+          } catch {}
+          try {
+            await env.DB.prepare('ALTER TABLE sales_orders ADD COLUMN unique_transfer_amount REAL DEFAULT 0').run();
+          } catch {}
           return Response.json({ success: true, message: '15 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
         }
 
@@ -635,7 +644,33 @@ export default {
               const subtotal = Number(o.subtotalDpp ?? o.subtotal_dpp ?? o.subtotal ?? 0);
               const ppn = Number(o.ppnAmount ?? o.ppn_amount ?? o.ppn ?? 0);
               const grand = Number(o.grandTotal ?? o.grand_total ?? (subtotal + ppn));
+              const uniqueCodeDiscountApplied = Number(
+                o.uniqueCodeDiscountApplied ?? o.unique_code_discount_applied ?? 0
+              );
+              const addedUniqueCode = Number(
+                o.addedUniqueCode ?? o.added_unique_code ?? o.paymentUniqueCode ?? o.payment_unique_code ?? 0
+              );
+              const paymentUniqueCode = Number(
+                o.paymentUniqueCode ?? o.payment_unique_code ?? addedUniqueCode
+              );
+              const explicitUniqueTransfer = Number(o.uniqueTransferAmount ?? o.unique_transfer_amount ?? 0);
+              const uniqueTransferAmount =
+                explicitUniqueTransfer > 0
+                  ? explicitUniqueTransfer
+                  : Math.max(0, grand - uniqueCodeDiscountApplied + addedUniqueCode);
               const orderDt = o.date || o.orderDate || new Date().toISOString().split('T')[0];
+              const enrichedOrder = {
+                ...o,
+                subtotalDpp: subtotal,
+                ppnAmount: ppn,
+                grandTotal: grand,
+                paymentUniqueCode,
+                uniqueCodeDiscountApplied,
+                addedUniqueCode,
+                uniqueCollisionResolved: Boolean(o.uniqueCollisionResolved ?? o.unique_collision_resolved ?? false),
+                uniqueReasonNote: o.uniqueReasonNote || o.unique_reason_note || '',
+                uniqueTransferAmount,
+              };
 
               stmts.push(
                 env.DB.prepare(
@@ -664,7 +699,7 @@ export default {
                   o.dispatchStatus || 'WAITING_PRICE_APPROVAL',
                   o.notes || '',
                   JSON.stringify(o.items || []),
-                  JSON.stringify(o)
+                  JSON.stringify(enrichedOrder)
                 )
               );
               insertedOrders++;
@@ -1070,6 +1105,7 @@ export default {
               creditLimit: Number(parsed.creditLimit ?? row.credit_limit ?? 0),
               currentReceivable: Number(parsed.currentReceivable ?? row.current_receivable ?? 0),
               paymentTerms: row.payment_terms || parsed.paymentTerms || 'CASH_BEFORE_DELIVERY',
+              uniqueCodeCreditBalance: Number(parsed.uniqueCodeCreditBalance ?? 0),
               bankAccounts: Array.isArray(parsed.bankAccounts) ? parsed.bankAccounts : [],
               notes: row.notes ?? parsed.notes ?? 'Tersinkron dari Cloudflare D1',
               createdAt: parsed.createdAt || (row.created_at ? String(row.created_at).slice(0, 10) : new Date().toISOString().split('T')[0]),
@@ -1140,6 +1176,24 @@ export default {
             const subtotalDpp = Number(parsed.subtotalDpp ?? row.subtotal_dpp ?? 0);
             const ppnAmount = Number(parsed.ppnAmount ?? row.ppn_amount ?? 0);
             const grandTotal = Number(parsed.grandTotal ?? row.grand_total ?? subtotalDpp + ppnAmount);
+            const uniqueCodeDiscountApplied = Number(
+              parsed.uniqueCodeDiscountApplied ?? row.unique_code_discount_applied ?? 0
+            );
+            const addedUniqueCode = Number(
+              parsed.addedUniqueCode ??
+                row.added_unique_code ??
+                parsed.paymentUniqueCode ??
+                row.payment_unique_code ??
+                0
+            );
+            const paymentUniqueCode = Number(
+              parsed.paymentUniqueCode ?? row.payment_unique_code ?? addedUniqueCode
+            );
+            const explicitUnique = Number(parsed.uniqueTransferAmount ?? row.unique_transfer_amount ?? 0);
+            const uniqueTransferAmount =
+              explicitUnique > 0
+                ? explicitUnique
+                : Math.max(0, grandTotal - uniqueCodeDiscountApplied + addedUniqueCode);
             const orderDate =
               parsed.date ||
               row.order_date ||
@@ -1165,6 +1219,14 @@ export default {
               ppnAmount,
               pph22Amount: Number(parsed.pph22Amount ?? 0),
               grandTotal,
+              paymentUniqueCode,
+              uniqueCodeDiscountApplied,
+              addedUniqueCode,
+              uniqueCollisionResolved: Boolean(
+                parsed.uniqueCollisionResolved ?? row.unique_collision_resolved ?? false
+              ),
+              uniqueReasonNote: parsed.uniqueReasonNote || row.unique_reason_note || '',
+              uniqueTransferAmount,
               negotiationStatus: row.negotiation_status || parsed.negotiationStatus || 'NOT_NEEDED',
               negotiationLogs: Array.isArray(parsed.negotiationLogs) ? parsed.negotiationLogs : [],
               paymentStatus: row.payment_status || parsed.paymentStatus || 'UNPAID',
@@ -1246,6 +1308,234 @@ export default {
         }
 
         return Response.json({ success: false, message: 'Database belum terkonfigurasi' }, { status: 400, headers: corsHeaders });
+      }
+
+      // 4B. Real-Time Cek Status Pembayaran & Verifikasi Mutasi Bank via Kode Unik 3-Digit
+      if (pathname === '/api/payments/check' && method === 'GET') {
+        if (!env.DB) {
+          return Response.json({ success: false, found: false, message: 'Cloudflare D1 belum terhubung.' }, { status: 400, headers: corsHeaders });
+        }
+        const amountParam = Math.round(Number(url.searchParams.get('amount') || 0));
+        const codeParam = Math.round(Number(url.searchParams.get('code') || 0));
+        const orderNumberParam = (url.searchParams.get('orderNumber') || '').trim();
+
+        const rows = (await env.DB.prepare('SELECT * FROM sales_orders ORDER BY created_at DESC LIMIT 200').all()).results || [];
+        const candidates = rows.map((row: any) => {
+          let parsed: any = {};
+          try { parsed = row.data_json ? JSON.parse(String(row.data_json)) : {}; } catch {}
+          const grandTotal = Number(parsed.grandTotal ?? row.grand_total ?? 0);
+          const uniqueCodeDiscountApplied = Number(parsed.uniqueCodeDiscountApplied ?? 0);
+          const addedUniqueCode = Number(parsed.addedUniqueCode ?? parsed.paymentUniqueCode ?? row.payment_unique_code ?? 0);
+          const paymentUniqueCode = Number(parsed.paymentUniqueCode ?? row.payment_unique_code ?? addedUniqueCode);
+          const uniqueTransferAmount = Number(
+            parsed.uniqueTransferAmount ??
+              row.unique_transfer_amount ??
+              Math.max(0, grandTotal - uniqueCodeDiscountApplied + addedUniqueCode)
+          );
+          return {
+            ...parsed,
+            id: parsed.id || row.id || row.order_number,
+            orderNumber: parsed.orderNumber || row.order_number,
+            customerId: parsed.customerId || row.customer_id || '',
+            customerName: row.customer_name || parsed.customerName || 'Pelanggan',
+            subtotalDpp: Number(parsed.subtotalDpp ?? row.subtotal_dpp ?? 0),
+            ppnAmount: Number(parsed.ppnAmount ?? row.ppn_amount ?? 0),
+            grandTotal,
+            uniqueCodeDiscountApplied,
+            addedUniqueCode,
+            paymentUniqueCode,
+            uniqueTransferAmount,
+            paymentStatus: row.payment_status || parsed.paymentStatus || 'UNPAID',
+            date: parsed.date || row.order_date || '',
+          };
+        });
+
+        let matched: any = null;
+        if (orderNumberParam) {
+          matched = candidates.find((c: any) => String(c.orderNumber).toLowerCase() === orderNumberParam.toLowerCase());
+        }
+        if (!matched && amountParam > 0) {
+          matched =
+            candidates.find((c: any) => Math.round(c.uniqueTransferAmount) === amountParam) ||
+            candidates.find((c: any) => c.paymentStatus !== 'PAID' && Math.round(c.grandTotal) === amountParam);
+        }
+        if (!matched && codeParam >= 100 && codeParam <= 999) {
+          matched =
+            candidates.find(
+              (c: any) =>
+                c.paymentStatus !== 'PAID' &&
+                (Math.round(c.uniqueTransferAmount) % 1000 === codeParam ||
+                  Number(c.addedUniqueCode) === codeParam ||
+                  Number(c.paymentUniqueCode) === codeParam)
+            ) ||
+            candidates.find(
+              (c: any) =>
+                Math.round(c.uniqueTransferAmount) % 1000 === codeParam ||
+                Number(c.addedUniqueCode) === codeParam ||
+                Number(c.paymentUniqueCode) === codeParam
+            );
+        }
+
+        if (!matched) {
+          return Response.json({
+            success: true,
+            found: false,
+            message: 'Tidak ada pesanan D1 yang cocok dengan nominal transfer / kode unik tersebut.',
+          }, { headers: corsHeaders });
+        }
+
+        return Response.json({
+          success: true,
+          found: true,
+          order: matched,
+          isPaid: matched.paymentStatus === 'PAID',
+          message:
+            matched.paymentStatus === 'PAID'
+              ? `Order ${matched.orderNumber} (${matched.customerName}) SUDAH LUNAS.`
+              : `Order ${matched.orderNumber} (${matched.customerName}) ditemukan dengan status ${matched.paymentStatus}. Wajib transfer tepat Rp ${matched.uniqueTransferAmount.toLocaleString('id-ID')}${matched.uniqueCodeDiscountApplied > 0 ? ` (Diskon Saldo −Rp ${matched.uniqueCodeDiscountApplied.toLocaleString('id-ID')})` : ''}${matched.addedUniqueCode > 0 ? ` (Kode Unik +${matched.addedUniqueCode})` : ''}.`,
+        }, { headers: corsHeaders });
+      }
+
+      if (pathname === '/api/payments/verify-mutation' && method === 'POST') {
+        if (!env.DB) {
+          return Response.json({ success: false, matched: false, message: 'Cloudflare D1 belum terhubung.' }, { status: 400, headers: corsHeaders });
+        }
+        const body: any = await request.json().catch(() => ({}));
+        const amountParam = Math.round(Number(body.amount || 0));
+        const codeParam = Math.round(Number(body.code || (amountParam >= 100 && amountParam <= 999 ? amountParam : 0)));
+        const orderNumberParam = String(body.orderNumber || '').trim();
+        const autoMarkPaid = body.autoMarkPaid !== false;
+
+        const rows = (await env.DB.prepare('SELECT * FROM sales_orders ORDER BY created_at DESC LIMIT 200').all()).results || [];
+        let targetRow: any = null;
+        let targetParsed: any = {};
+
+        for (const row of rows) {
+          if (row.payment_status === 'CANCELLED') continue;
+          let parsed: any = {};
+          try { parsed = row.data_json ? JSON.parse(String(row.data_json)) : {}; } catch {}
+          const grandTotal = Number(parsed.grandTotal ?? row.grand_total ?? 0);
+          const uniqueDiscount = Number(parsed.uniqueCodeDiscountApplied ?? 0);
+          const addedUnique = Number(parsed.addedUniqueCode ?? parsed.paymentUniqueCode ?? row.payment_unique_code ?? 0);
+          const uniqueCode = Number(parsed.paymentUniqueCode ?? row.payment_unique_code ?? addedUnique);
+          const uniqueTransfer = Number(
+            parsed.uniqueTransferAmount ??
+              row.unique_transfer_amount ??
+              Math.max(0, grandTotal - uniqueDiscount + addedUnique)
+          );
+          const ordNum = parsed.orderNumber || row.order_number;
+
+          const baseTarget = {
+            ...parsed,
+            grandTotal,
+            uniqueCodeDiscountApplied: uniqueDiscount,
+            addedUniqueCode: addedUnique,
+            paymentUniqueCode: uniqueCode,
+            uniqueTransferAmount: uniqueTransfer,
+            orderNumber: ordNum,
+            customerId: parsed.customerId || row.customer_id || '',
+          };
+
+          if (orderNumberParam && String(ordNum).toLowerCase() === orderNumberParam.toLowerCase()) {
+            targetRow = row;
+            targetParsed = baseTarget;
+            break;
+          }
+          if (amountParam > 999 && Math.round(uniqueTransfer) === amountParam) {
+            targetRow = row;
+            targetParsed = baseTarget;
+            break;
+          }
+          if (
+            codeParam >= 100 &&
+            codeParam <= 999 &&
+            row.payment_status !== 'PAID' &&
+            (Math.round(uniqueTransfer) % 1000 === codeParam || addedUnique === codeParam || uniqueCode === codeParam)
+          ) {
+            targetRow = row;
+            targetParsed = baseTarget;
+            break;
+          }
+        }
+
+        if (!targetRow) {
+          return Response.json({
+            success: true,
+            matched: false,
+            message: 'Mutasi transfer belum cocok dengan tagihan kode unik aktif di D1.',
+          }, { headers: corsHeaders });
+        }
+
+        if (autoMarkPaid && targetRow.payment_status !== 'PAID') {
+          const updatedJson = JSON.stringify({
+            ...targetParsed,
+            paymentStatus: 'PAID',
+            paymentVerifiedAt: new Date().toISOString(),
+            paymentVerificationBank: body.bank || 'Mutasi Bank Otomatis',
+            paymentReferenceNumber: body.referenceNumber || `MUT-${Date.now().toString().slice(-6)}`,
+          });
+
+          await env.DB.batch([
+            env.DB.prepare(
+              `UPDATE sales_orders SET payment_status = 'PAID', data_json = ?1 WHERE order_number = ?2`
+            ).bind(updatedJson, targetParsed.orderNumber),
+            env.DB.prepare(
+              `UPDATE invoices SET payment_status = 'PAID' WHERE order_number = ?1`
+            ).bind(targetParsed.orderNumber),
+          ]);
+
+          // Recalculate and update buyer's uniqueCodeCreditBalance in D1 customers table
+          if (targetParsed.customerId) {
+            try {
+              const custRow: any = await env.DB.prepare('SELECT * FROM customers WHERE id = ?1 LIMIT 1')
+                .bind(targetParsed.customerId)
+                .first();
+              if (custRow) {
+                const paidRows =
+                  (await env.DB.prepare(
+                    `SELECT grand_total, payment_unique_code, unique_transfer_amount, data_json FROM sales_orders WHERE customer_id = ?1 AND payment_status = 'PAID'`
+                  )
+                    .bind(targetParsed.customerId)
+                    .all()).results || [];
+                let netBalance = 0;
+                for (const po of paidRows) {
+                  let pJson: any = {};
+                  try { pJson = po.data_json ? JSON.parse(String(po.data_json)) : {}; } catch {}
+                  const gTotal = Number(pJson.grandTotal ?? po.grand_total ?? 0);
+                  const disc = Number(pJson.uniqueCodeDiscountApplied ?? 0);
+                  const add = Number(pJson.addedUniqueCode ?? pJson.paymentUniqueCode ?? po.payment_unique_code ?? 0);
+                  const uAmt = Number(pJson.uniqueTransferAmount ?? po.unique_transfer_amount ?? Math.max(0, gTotal - disc + add));
+                  netBalance += (uAmt - gTotal);
+                }
+                let prevCustJson: any = {};
+                try { prevCustJson = custRow.data_json ? JSON.parse(String(custRow.data_json)) : {}; } catch {}
+                const newCustJson = JSON.stringify({
+                  ...prevCustJson,
+                  uniqueCodeCreditBalance: Math.max(0, Math.round(netBalance)),
+                });
+                await env.DB.prepare('UPDATE customers SET data_json = ?1 WHERE id = ?2')
+                  .bind(newCustJson, targetParsed.customerId)
+                  .run();
+              }
+            } catch (e) {
+              console.warn('Update customer uniqueCodeCreditBalance warn:', e);
+            }
+          }
+        }
+
+        return Response.json({
+          success: true,
+          matched: true,
+          order: {
+            ...targetParsed,
+            id: targetParsed.id || targetRow.id || targetParsed.orderNumber,
+            customerName: targetRow.customer_name || targetParsed.customerName || 'Pelanggan',
+            paymentStatus: autoMarkPaid ? 'PAID' : targetRow.payment_status,
+          },
+          message: autoMarkPaid
+            ? `LUNAS REAL-TIME: Pesanan ${targetParsed.orderNumber} cocok (Transfer Rp ${targetParsed.uniqueTransferAmount.toLocaleString('id-ID')}) dan status D1 + saldo angka unik customer langsung diupdate!`
+            : `Cocok dengan pesanan ${targetParsed.orderNumber} (Transfer Rp ${targetParsed.uniqueTransferAmount.toLocaleString('id-ID')}).`,
+        }, { headers: corsHeaders });
       }
 
       // 5. SiPajak PJAP Resmi DJP (Host-to-Host Coretax Proxy)
