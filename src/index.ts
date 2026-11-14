@@ -16,9 +16,34 @@ export interface Env {
   SIPAJAK_USERNAME?: string;
   SIPAJAK_PASSWORD?: string;
   RESEND_API_KEY?: string;
+  RESEND_KEY?: string;
+  RESEND_TOKEN?: string;
+  RESEND_SECRET?: string;
+  BREVO_API_KEY?: string;
+  BREVO_KEY?: string;
+  SIB_API_KEY?: string;
+  SENDGRID_API_KEY?: string;
+  SENDGRID_KEY?: string;
+  POSTMARK_API_KEY?: string;
+  POSTMARK_SERVER_TOKEN?: string;
+  MAILGUN_API_KEY?: string;
+  MAILGUN_DOMAIN?: string;
+  MAILCHANNELS_API_KEY?: string;
+  SMTP2GO_API_KEY?: string;
+  ZEPTOMAIL_API_KEY?: string;
+  ZEPTO_API_KEY?: string;
+  EMAIL_WEBHOOK_URL?: string;
+  MAIL_WEBHOOK_URL?: string;
+  GAS_EMAIL_URL?: string;
+  OTP_WEBHOOK_URL?: string;
   AUTH_FROM_EMAIL?: string;
+  FROM_EMAIL?: string;
+  EMAIL_FROM?: string;
+  RESEND_FROM?: string;
+  MAIL_FROM?: string;
   AUTH_ADMIN_EMAIL?: string;
   AUTH_ADMIN_PASSWORD?: string;
+  [key: string]: any;
 }
 
 const enc = new TextEncoder();
@@ -299,33 +324,274 @@ async function ensureAuthTables(db: any, env?: Env): Promise<void> {
   }
 }
 
-async function sendOtpEmail(env: Env, email: string, otp: string): Promise<{ sent: boolean; provider?: string }> {
-  if (!env.RESEND_API_KEY) {
-    return { sent: false };
+function pickEnv(env: Record<string, any> | undefined, keys: string[]): string {
+  if (!env) return '';
+  for (const k of keys) {
+    const v = env[k];
+    if (typeof v === 'string' && v.trim()) return v.trim();
   }
+  return '';
+}
+
+function getConfiguredEmailKeys(env: Record<string, any> | undefined): string[] {
+  if (!env) return [];
+  const pattern = /^(RESEND|BREVO|SIB|SENDGRID|MAILGUN|POSTMARK|MAILCHANNELS|SMTP|GMAIL|ZEPTO|EMAIL|MAIL|OTP_WEBHOOK|AUTH_FROM|FROM_EMAIL)/i;
+  return Object.keys(env)
+    .filter((k) => pattern.test(k) && typeof env[k] === 'string' && env[k].trim().length > 0)
+    .sort();
+}
+
+function resolveEmailProviderConfig(env: Record<string, any> | undefined): { configured: boolean; provider?: string } {
+  if (pickEnv(env, ['RESEND_API_KEY', 'RESEND_KEY', 'RESEND_TOKEN', 'RESEND_SECRET'])) return { configured: true, provider: 'resend' };
+  if (pickEnv(env, ['BREVO_API_KEY', 'BREVO_KEY', 'SIB_API_KEY'])) return { configured: true, provider: 'brevo' };
+  if (pickEnv(env, ['SENDGRID_API_KEY', 'SENDGRID_KEY'])) return { configured: true, provider: 'sendgrid' };
+  if (pickEnv(env, ['POSTMARK_API_KEY', 'POSTMARK_SERVER_TOKEN'])) return { configured: true, provider: 'postmark' };
+  if (pickEnv(env, ['MAILGUN_API_KEY']) && pickEnv(env, ['MAILGUN_DOMAIN'])) return { configured: true, provider: 'mailgun' };
+  if (pickEnv(env, ['SMTP2GO_API_KEY'])) return { configured: true, provider: 'smtp2go' };
+  if (pickEnv(env, ['ZEPTOMAIL_API_KEY', 'ZEPTO_API_KEY'])) return { configured: true, provider: 'zeptomail' };
+  if (pickEnv(env, ['MAILCHANNELS_API_KEY'])) return { configured: true, provider: 'mailchannels' };
+  if (pickEnv(env, ['EMAIL_WEBHOOK_URL', 'MAIL_WEBHOOK_URL', 'GAS_EMAIL_URL', 'OTP_WEBHOOK_URL'])) return { configured: true, provider: 'webhook' };
+  return { configured: false };
+}
+
+function parseSenderAddress(raw: string): { name: string; email: string; formatted: string } {
+  const clean = (raw || '').trim() || 'SGN Sembako <onboarding@resend.dev>';
+  const match = clean.match(/^(.*)<([^<>]+)>$/);
+  if (match) {
+    const name = match[1].trim().replace(/^"|"$/g, '') || 'SGN Sembako';
+    const email = match[2].trim();
+    return { name, email, formatted: `${name} <${email}>` };
+  }
+  return { name: 'SGN Sembako', email: clean, formatted: `SGN Sembako <${clean}>` };
+}
+
+async function readErrSnippet(res: Response): Promise<string> {
   try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${env.RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from: env.AUTH_FROM_EMAIL || 'SGN Sembako <onboarding@resend.dev>',
-        to: [email],
-        subject: `Kode Verifikasi Login SGN Sembako: ${otp}`,
-        html: `<div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;">
-          <h2 style="color:#0f172a;margin:0 0 8px;">Verifikasi 2 Langkah SGN Sembako</h2>
-          <p style="color:#475569;font-size:14px;">Gunakan kode 6 digit berikut untuk menyelesaikan login ke ERP (berlaku 5 menit):</p>
-          <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#d97706;background:#fffbeb;padding:16px;text-align:center;border-radius:8px;margin:16px 0;">${otp}</div>
-          <p style="color:#64748b;font-size:12px;">Jika Anda tidak mencoba masuk, abaikan email ini.</p>
-        </div>`,
-      }),
-    });
-    return { sent: res.ok, provider: 'resend' };
+    const txt = (await res.text()).replace(/\s+/g, ' ').trim();
+    return txt.slice(0, 220);
   } catch {
-    return { sent: false };
+    return '';
   }
+}
+
+async function sendOtpEmail(
+  env: Env,
+  email: string,
+  otp: string
+): Promise<{ sent: boolean; provider?: string; error?: string }> {
+  const fromRaw = pickEnv(env, ['AUTH_FROM_EMAIL', 'FROM_EMAIL', 'EMAIL_FROM', 'RESEND_FROM', 'MAIL_FROM']);
+  const sender = parseSenderAddress(fromRaw);
+  const subject = `Kode Verifikasi Login SGN Sembako: ${otp}`;
+  const text = `Kode verifikasi 2 langkah SGN Sembako Anda: ${otp} (berlaku 5 menit). Jika Anda tidak mencoba masuk, abaikan email ini.`;
+  const html = `<div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;">
+    <h2 style="color:#0f172a;margin:0 0 8px;">Verifikasi 2 Langkah SGN Sembako</h2>
+    <p style="color:#475569;font-size:14px;">Gunakan kode 6 digit berikut untuk menyelesaikan login ke ERP (berlaku 5 menit):</p>
+    <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#d97706;background:#fffbeb;padding:16px;text-align:center;border-radius:8px;margin:16px 0;">${otp}</div>
+    <p style="color:#64748b;font-size:12px;">Jika Anda tidak mencoba masuk, abaikan email ini.</p>
+  </div>`;
+
+  const errors: string[] = [];
+
+  const resendKey = pickEnv(env, ['RESEND_API_KEY', 'RESEND_KEY', 'RESEND_TOKEN', 'RESEND_SECRET']);
+  if (resendKey) {
+    try {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: sender.formatted, to: [email], subject, html, text }),
+      });
+      if (res.ok) return { sent: true, provider: 'resend' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`Resend HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`Resend error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const brevoKey = pickEnv(env, ['BREVO_API_KEY', 'BREVO_KEY', 'SIB_API_KEY']);
+  if (brevoKey) {
+    try {
+      const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': brevoKey, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          sender: { name: sender.name, email: fromRaw ? sender.email : email },
+          to: [{ email }],
+          subject,
+          htmlContent: html,
+          textContent: text,
+        }),
+      });
+      if (res.ok) return { sent: true, provider: 'brevo' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`Brevo HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`Brevo error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const sendgridKey = pickEnv(env, ['SENDGRID_API_KEY', 'SENDGRID_KEY']);
+  if (sendgridKey) {
+    try {
+      const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${sendgridKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email }] }],
+          from: { email: fromRaw ? sender.email : email, name: sender.name },
+          subject,
+          content: [
+            { type: 'text/plain', value: text },
+            { type: 'text/html', value: html },
+          ],
+        }),
+      });
+      if (res.ok) return { sent: true, provider: 'sendgrid' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`SendGrid HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`SendGrid error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const postmarkKey = pickEnv(env, ['POSTMARK_API_KEY', 'POSTMARK_SERVER_TOKEN']);
+  if (postmarkKey) {
+    try {
+      const res = await fetch('https://api.postmarkapp.com/email', {
+        method: 'POST',
+        headers: { 'X-Postmark-Server-Token': postmarkKey, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          From: fromRaw ? sender.formatted : email,
+          To: email,
+          Subject: subject,
+          HtmlBody: html,
+          TextBody: text,
+        }),
+      });
+      if (res.ok) return { sent: true, provider: 'postmark' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`Postmark HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`Postmark error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const mailgunKey = pickEnv(env, ['MAILGUN_API_KEY']);
+  const mailgunDomain = pickEnv(env, ['MAILGUN_DOMAIN']);
+  if (mailgunKey && mailgunDomain) {
+    try {
+      const form = new URLSearchParams({
+        from: fromRaw ? sender.formatted : `SGN Sembako <noreply@${mailgunDomain}>`,
+        to: email,
+        subject,
+        text,
+        html,
+      });
+      const res = await fetch(`https://api.mailgun.net/v3/${mailgunDomain}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Basic ${btoa(`api:${mailgunKey}`)}` },
+        body: form,
+      });
+      if (res.ok) return { sent: true, provider: 'mailgun' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`Mailgun HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`Mailgun error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const smtp2goKey = pickEnv(env, ['SMTP2GO_API_KEY']);
+  if (smtp2goKey) {
+    try {
+      const res = await fetch('https://api.smtp2go.com/v3/email/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: smtp2goKey,
+          sender: fromRaw ? sender.formatted : email,
+          to: [email],
+          subject,
+          text_body: text,
+          html_body: html,
+        }),
+      });
+      if (res.ok) return { sent: true, provider: 'smtp2go' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`SMTP2GO HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`SMTP2GO error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const zeptoKey = pickEnv(env, ['ZEPTOMAIL_API_KEY', 'ZEPTO_API_KEY']);
+  if (zeptoKey) {
+    try {
+      const authHeader = zeptoKey.startsWith('Zoho-enczapikey ') ? zeptoKey : `Zoho-enczapikey ${zeptoKey}`;
+      const res = await fetch('https://api.zeptomail.com/v1.1/email', {
+        method: 'POST',
+        headers: { Authorization: authHeader, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          from: { address: fromRaw ? sender.email : email, name: sender.name },
+          to: [{ email_address: { address: email } }],
+          subject,
+          htmlbody: html,
+        }),
+      });
+      if (res.ok) return { sent: true, provider: 'zeptomail' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`ZeptoMail HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`ZeptoMail error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const mailchannelsKey = pickEnv(env, ['MAILCHANNELS_API_KEY']);
+  if (mailchannelsKey) {
+    try {
+      const res = await fetch('https://api.mailchannels.net/tx/v1/send', {
+        method: 'POST',
+        headers: { 'X-Api-Key': mailchannelsKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email }] }],
+          from: { email: sender.email, name: sender.name },
+          subject,
+          content: [
+            { type: 'text/plain', value: text },
+            { type: 'text/html', value: html },
+          ],
+        }),
+      });
+      if (res.ok) return { sent: true, provider: 'mailchannels' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`MailChannels HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`MailChannels error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  const webhookUrl = pickEnv(env, ['EMAIL_WEBHOOK_URL', 'MAIL_WEBHOOK_URL', 'GAS_EMAIL_URL', 'OTP_WEBHOOK_URL']);
+  if (webhookUrl) {
+    try {
+      const res = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: email, email, from: sender.formatted, subject, otp, code: otp, text, html }),
+      });
+      if (res.ok) return { sent: true, provider: 'webhook' };
+      const snippet = await readErrSnippet(res);
+      errors.push(`Webhook HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+    } catch (err: any) {
+      errors.push(`Webhook error: ${err?.message || 'gagal fetch'}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    return { sent: false, provider: resolveEmailProviderConfig(env).provider, error: errors.join(' | ') };
+  }
+  return {
+    sent: false,
+    error: 'Secret provider email (RESEND_API_KEY / BREVO_API_KEY / SENDGRID_API_KEY / EMAIL_WEBHOOK_URL) belum diatur pada Worker.',
+  };
 }
 
 function getDbClient(env: Env): Client {
@@ -406,10 +672,13 @@ export default {
 
         if (pathname === '/api/auth/setup-status' && method === 'GET') {
           const countRow: any = await env.DB.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
+          const mailCfg = resolveEmailProviderConfig(env);
           return Response.json(
             {
               hasUsers: Number(countRow?.cnt || 0) > 0,
-              emailProviderConfigured: Boolean(env.RESEND_API_KEY),
+              emailProviderConfigured: mailCfg.configured,
+              emailProvider: mailCfg.provider || null,
+              detectedMailKeys: getConfiguredEmailKeys(env),
             },
             { headers: corsHeaders }
           );
@@ -459,6 +728,9 @@ export default {
               email: maskEmail(email),
               resendAfterSec: 60,
               emailSent: mailResult.sent,
+              emailProvider: mailResult.provider || null,
+              ...(mailResult.error ? { emailError: mailResult.error } : {}),
+              detectedMailKeys: getConfiguredEmailKeys(env),
               ...(mailResult.sent ? {} : { devOtp: otp }),
             },
             { headers: corsHeaders }
@@ -513,6 +785,9 @@ export default {
               email: maskEmail(String(user.email)),
               resendAfterSec: 60,
               emailSent: mailResult.sent,
+              emailProvider: mailResult.provider || null,
+              ...(mailResult.error ? { emailError: mailResult.error } : {}),
+              detectedMailKeys: getConfiguredEmailKeys(env),
               ...(mailResult.sent ? {} : { devOtp: otp }),
             },
             { headers: corsHeaders }
@@ -631,6 +906,9 @@ export default {
               ok: true,
               resendAfterSec: 60,
               emailSent: mailResult.sent,
+              emailProvider: mailResult.provider || null,
+              ...(mailResult.error ? { emailError: mailResult.error } : {}),
+              detectedMailKeys: getConfiguredEmailKeys(env),
               ...(mailResult.sent ? {} : { devOtp: otp }),
             },
             { headers: corsHeaders }
