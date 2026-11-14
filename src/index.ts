@@ -126,6 +126,74 @@ async function addMissingColumns(
   }
 }
 
+async function recreateAuthChallengesTable(db: any): Promise<void> {
+  await db.prepare('DROP TABLE IF EXISTS auth_challenges').run();
+  await db
+    .prepare(`CREATE TABLE auth_challenges (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      last_sent_at INTEGER NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      used INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`)
+    .run();
+}
+
+async function recreateAuthSessionsTable(db: any): Promise<void> {
+  await db.prepare('DROP TABLE IF EXISTS auth_sessions').run();
+  await db
+    .prepare(`CREATE TABLE auth_sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`)
+    .run();
+}
+
+async function insertChallengeSafely(
+  db: any,
+  challengeId: string,
+  userId: string,
+  email: string,
+  codeHash: string,
+  expiresAt: number,
+  nowMs: number
+): Promise<void> {
+  const createdAt = new Date(nowMs).toISOString();
+  const sql =
+    'INSERT INTO auth_challenges (id, user_id, email, code_hash, expires_at, last_sent_at, attempts, used, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)';
+  try {
+    await db.prepare(sql).bind(challengeId, userId, email, codeHash, expiresAt, nowMs, createdAt).run();
+  } catch {
+    await recreateAuthChallengesTable(db);
+    await db.prepare(sql).bind(challengeId, userId, email, codeHash, expiresAt, nowMs, createdAt).run();
+  }
+}
+
+async function insertSessionSafely(
+  db: any,
+  tokenHash: string,
+  userId: string,
+  email: string,
+  expiresAt: number
+): Promise<void> {
+  const createdAt = new Date().toISOString();
+  const sql =
+    'INSERT INTO auth_sessions (token_hash, user_id, email, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5)';
+  try {
+    await db.prepare(sql).bind(tokenHash, userId, email, expiresAt, createdAt).run();
+  } catch {
+    await recreateAuthSessionsTable(db);
+    await db.prepare(sql).bind(tokenHash, userId, email, expiresAt, createdAt).run();
+  }
+}
+
 async function ensureAuthTables(db: any, env?: Env): Promise<void> {
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS auth_users (
@@ -180,18 +248,7 @@ async function ensureAuthTables(db: any, env?: Env): Promise<void> {
     );
 
   if (hasBlockingChallengeCol) {
-    await db.prepare('DROP TABLE IF EXISTS auth_challenges').run();
-    await db.prepare(`CREATE TABLE auth_challenges (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      email TEXT NOT NULL,
-      code_hash TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      last_sent_at INTEGER NOT NULL,
-      attempts INTEGER DEFAULT 0,
-      used INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`).run();
+    await recreateAuthChallengesTable(db);
   } else {
     const chColNames = new Set(challengeCols.map((c) => String(c.name)));
     await addMissingColumns(db, 'auth_challenges', chColNames, [
@@ -217,14 +274,7 @@ async function ensureAuthTables(db: any, env?: Env): Promise<void> {
     );
 
   if (hasBlockingSessionCol) {
-    await db.prepare('DROP TABLE IF EXISTS auth_sessions').run();
-    await db.prepare(`CREATE TABLE auth_sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      email TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`).run();
+    await recreateAuthSessionsTable(db);
   } else {
     const sesColNames = new Set(sessionCols.map((c) => String(c.name)));
     await addMissingColumns(db, 'auth_sessions', sesColNames, [
@@ -240,9 +290,10 @@ async function ensureAuthTables(db: any, env?: Env): Promise<void> {
     if (Number(countRow?.cnt || 0) === 0) {
       const adminEmail = env.AUTH_ADMIN_EMAIL.trim().toLowerCase();
       const { hash, salt } = await hashPasswordPBKDF2(env.AUTH_ADMIN_PASSWORD);
+      const nowIso = new Date().toISOString();
       await db
-        .prepare('INSERT OR IGNORE INTO auth_users (id, email, password_hash, password_salt, role) VALUES (?1, ?2, ?3, ?4, ?5)')
-        .bind(`usr-${randomHex(8)}`, adminEmail, hash, salt, 'ADMIN')
+        .prepare('INSERT OR IGNORE INTO auth_users (id, email, password_hash, password_salt, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)')
+        .bind(`usr-${randomHex(8)}`, adminEmail, hash, salt, 'ADMIN', nowIso, nowIso)
         .run();
     }
   }
@@ -387,21 +438,18 @@ export default {
 
           const userId = `usr-${randomHex(8)}`;
           const { hash, salt } = await hashPasswordPBKDF2(password);
+          const nowIso = new Date().toISOString();
           await env.DB.prepare(
-            'INSERT INTO auth_users (id, email, password_hash, password_salt, role) VALUES (?1, ?2, ?3, ?4, ?5)'
+            'INSERT INTO auth_users (id, email, password_hash, password_salt, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)'
           )
-            .bind(userId, email, hash, salt, 'ADMIN')
+            .bind(userId, email, hash, salt, 'ADMIN', nowIso, nowIso)
             .run();
 
           const challengeId = `chg-${randomHex(16)}`;
           const otp = generateOtp6();
           const codeHash = await sha256Hex(`${otp}:${challengeId}`);
           const now = Date.now();
-          await env.DB.prepare(
-            'INSERT INTO auth_challenges (id, user_id, email, code_hash, expires_at, last_sent_at, attempts, used) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)'
-          )
-            .bind(challengeId, userId, email, codeHash, now + 5 * 60 * 1000, now)
-            .run();
+          await insertChallengeSafely(env.DB, challengeId, userId, email, codeHash, now + 5 * 60 * 1000, now);
 
           const mailResult = await sendOtpEmail(env, email, otp);
           return Response.json(
@@ -455,11 +503,7 @@ export default {
           const otp = generateOtp6();
           const codeHash = await sha256Hex(`${otp}:${challengeId}`);
           const now = Date.now();
-          await env.DB.prepare(
-            'INSERT INTO auth_challenges (id, user_id, email, code_hash, expires_at, last_sent_at, attempts, used) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)'
-          )
-            .bind(challengeId, user.id, user.email, codeHash, now + 5 * 60 * 1000, now)
-            .run();
+          await insertChallengeSafely(env.DB, challengeId, String(user.id), String(user.email), codeHash, now + 5 * 60 * 1000, now);
 
           const mailResult = await sendOtpEmail(env, String(user.email), otp);
           return Response.json(
@@ -530,12 +574,8 @@ export default {
           const token = randomHex(32);
           const tokenHash = await sha256Hex(token);
           const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-          await env.DB.batch([
-            env.DB.prepare('UPDATE auth_challenges SET used = 1 WHERE id = ?1').bind(challengeId),
-            env.DB.prepare(
-              'INSERT INTO auth_sessions (token_hash, user_id, email, expires_at) VALUES (?1, ?2, ?3, ?4)'
-            ).bind(tokenHash, ch.user_id, resolvedEmail, expiresAt),
-          ]);
+          await env.DB.prepare('UPDATE auth_challenges SET used = 1 WHERE id = ?1').bind(challengeId).run();
+          await insertSessionSafely(env.DB, tokenHash, String(ch.user_id), resolvedEmail, expiresAt);
 
           return Response.json(
             {
