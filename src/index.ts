@@ -918,25 +918,47 @@ export default {
             }
           }
 
-          // 14. Employees
+          // 14. Employees (termasuk penghapusan & sinkronisasi ID berurutan)
+          if (payload.replaceEmployees === true && Array.isArray(payload.employees)) {
+            stmts.push(env.DB.prepare('DELETE FROM employees'));
+          } else if (Array.isArray(payload.deletedEmployeeIds) && payload.deletedEmployeeIds.length > 0) {
+            for (const delId of payload.deletedEmployeeIds) {
+              const cleanDelId = String(delId || '').trim();
+              if (cleanDelId) {
+                stmts.push(env.DB.prepare('DELETE FROM employees WHERE id = ?1').bind(cleanDelId));
+              }
+            }
+          }
+
           if (Array.isArray(payload.employees)) {
             for (const emp of payload.employees) {
+              const empId = emp.id || emp.code;
+              if (emp.code) {
+                stmts.push(
+                  env.DB.prepare('DELETE FROM employees WHERE code = ?1 AND id != ?2').bind(
+                    emp.code,
+                    empId
+                  )
+                );
+              }
               stmts.push(
                 env.DB.prepare(
                   `INSERT INTO employees (id, code, name, role_title, department, payroll_scheme, ptkp_status, npwp_or_nik, base_salary, fixed_allowance, status, data_json)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                   ON CONFLICT(code) DO UPDATE SET
+                   ON CONFLICT(id) DO UPDATE SET
+                     code=excluded.code,
                      name=excluded.name,
                      role_title=excluded.role_title,
                      department=excluded.department,
                      payroll_scheme=excluded.payroll_scheme,
                      ptkp_status=excluded.ptkp_status,
+                     npwp_or_nik=excluded.npwp_or_nik,
                      base_salary=excluded.base_salary,
                      fixed_allowance=excluded.fixed_allowance,
                      status=excluded.status,
                      data_json=excluded.data_json`
                 ).bind(
-                  emp.id || emp.code,
+                  empId,
                   emp.code,
                   emp.name || '',
                   emp.roleTitle || '',
