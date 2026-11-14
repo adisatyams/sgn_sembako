@@ -893,6 +893,7 @@ export default {
                    ON CONFLICT(code) DO UPDATE SET
                      name=excluded.name,
                      role_title=excluded.role_title,
+                     department=excluded.department,
                      payroll_scheme=excluded.payroll_scheme,
                      ptkp_status=excluded.ptkp_status,
                      base_salary=excluded.base_salary,
@@ -1075,14 +1076,67 @@ export default {
             };
           };
 
+          const normalizeOrderItem = (item: any) => {
+            if (!item || typeof item !== 'object') return item;
+            const quantity = Number(item.quantity ?? item.qty ?? 0);
+            const negotiatedUnitPrice = Number(item.negotiatedUnitPrice ?? item.unitPrice ?? item.unit_price ?? item.price ?? 0);
+            const standardUnitPrice = Number(item.standardUnitPrice ?? item.standard_unit_price ?? negotiatedUnitPrice);
+            const discountAmount = Number(item.discountAmount ?? item.discount_amount ?? Math.max(0, (standardUnitPrice - negotiatedUnitPrice) * quantity));
+            const totalPrice = Number(item.totalPrice ?? item.total_price ?? item.subtotal ?? negotiatedUnitPrice * quantity);
+            return {
+              productSkuId: item.productSkuId || item.product_sku_id || item.productCode || item.product_code || 'sku-1',
+              productName: item.productName || item.product_name || 'Minyak Goreng',
+              quantity,
+              unit: item.unit || 'Karton',
+              standardUnitPrice,
+              negotiatedUnitPrice,
+              discountAmount,
+              totalPrice,
+            };
+          };
+
+          const normalizeReseller = (row: any) => {
+            const parsed = safeJson(row.data_json, {}) || {};
+            const code = parsed.code || row.code || `RSL-BOT-${String(row.id || '').slice(0, 6)}`;
+            const name = row.name || parsed.name || 'Mitra Reseller';
+            return {
+              ...parsed,
+              id: parsed.id || row.id || code,
+              code,
+              name,
+              nik: row.nik ?? parsed.nik ?? '',
+              npwp: row.npwp ?? parsed.npwp ?? '',
+              shopName: parsed.shopName || row.shop_name || name,
+              area: row.area || parsed.area || 'Jakarta Utara',
+              address: parsed.address || row.area || parsed.area || '-',
+              phone: row.phone || parsed.phone || '-',
+              tierLevel: parsed.tierLevel || row.tier_level || 'BRONZE',
+              targetMonthlyVolumeCtn: Number(parsed.targetMonthlyVolumeCtn ?? 250),
+              currentMonthVolumeCtn: Number(parsed.currentMonthVolumeCtn ?? 0),
+              commissionRatePct: Number(parsed.commissionRatePct ?? row.commission_rate_pct ?? 2.5),
+              creditLimit: Number(parsed.creditLimit ?? row.credit_limit ?? 10000000),
+              balanceOwed: Number(parsed.balanceOwed ?? row.balance_owed ?? 0),
+              status: row.status || parsed.status || 'ACTIVE',
+              bankAccount:
+                parsed.bankAccount && typeof parsed.bankAccount === 'object'
+                  ? parsed.bankAccount
+                  : { bank: 'BCA', accountNumber: '', holderName: name },
+              joinDate:
+                parsed.joinDate ||
+                (parsed.createdAt ? String(parsed.createdAt).slice(0, 10) : null) ||
+                (row.created_at ? String(row.created_at).slice(0, 10) : new Date().toISOString().split('T')[0]),
+            };
+          };
+
           const normalizeOrder = (row: any) => {
             const parsed = safeJson(row.data_json, {}) || {};
             const parsedItems = safeJson(row.items_json, null);
-            const items = Array.isArray(parsed.items)
+            const rawItems = Array.isArray(parsed.items)
               ? parsed.items
               : Array.isArray(parsedItems)
               ? parsedItems
               : [];
+            const items = rawItems.map(normalizeOrderItem);
             const subtotalDpp = Number(parsed.subtotalDpp ?? row.subtotal_dpp ?? 0);
             const ppnAmount = Number(parsed.ppnAmount ?? row.ppn_amount ?? 0);
             const grandTotal = Number(parsed.grandTotal ?? row.grand_total ?? subtotalDpp + ppnAmount);
@@ -1153,7 +1207,7 @@ export default {
             data: {
               company: companyRes[0]?.data_json ? safeJson(companyRes[0].data_json, companyRes[0]) : companyRes[0] || null,
               customers: customers.map(normalizeCustomer),
-              resellers: resellers.map((r: any) => safeJson(r.data_json, r)),
+              resellers: resellers.map(normalizeReseller),
               warehouses: warehouses.map((w: any) => safeJson(w.data_json, w)),
               products: products.map((p: any) => safeJson(p.data_json, p)),
               stockBatches: stockBatches.map((b: any) => safeJson(b.data_json, b)),
