@@ -34,8 +34,14 @@ export interface Env {
   ZEPTO_API_KEY?: string;
   EMAIL_WEBHOOK_URL?: string;
   MAIL_WEBHOOK_URL?: string;
+  MAIL_WEBHOOK_SECRET?: string;
+  EMAIL_WEBHOOK_SECRET?: string;
   GAS_EMAIL_URL?: string;
+  GAS_EMAIL_SECRET?: string;
   OTP_WEBHOOK_URL?: string;
+  OTP_WEBHOOK_SECRET?: string;
+  EMAIL?: any;
+  SEND_EMAIL?: any;
   AUTH_FROM_EMAIL?: string;
   FROM_EMAIL?: string;
   EMAIL_FROM?: string;
@@ -43,6 +49,8 @@ export interface Env {
   MAIL_FROM?: string;
   AUTH_ADMIN_EMAIL?: string;
   AUTH_ADMIN_PASSWORD?: string;
+  ADMIN_EMAIL?: string;
+  ADMIN_INITIAL_PASSWORD?: string;
   [key: string]: any;
 }
 
@@ -310,15 +318,16 @@ async function ensureAuthTables(db: any, env?: Env): Promise<void> {
     ]);
   }
 
-  if (env?.AUTH_ADMIN_EMAIL && env?.AUTH_ADMIN_PASSWORD) {
+  const seedPwd = env?.AUTH_ADMIN_PASSWORD || env?.ADMIN_INITIAL_PASSWORD;
+  const seedEmail = (env?.AUTH_ADMIN_EMAIL || env?.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (seedEmail && seedPwd) {
     const countRow: any = await db.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
     if (Number(countRow?.cnt || 0) === 0) {
-      const adminEmail = env.AUTH_ADMIN_EMAIL.trim().toLowerCase();
-      const { hash, salt } = await hashPasswordPBKDF2(env.AUTH_ADMIN_PASSWORD);
+      const { hash, salt } = await hashPasswordPBKDF2(seedPwd);
       const nowIso = new Date().toISOString();
       await db
         .prepare('INSERT OR IGNORE INTO auth_users (id, email, password_hash, password_salt, role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)')
-        .bind(`usr-${randomHex(8)}`, adminEmail, hash, salt, 'ADMIN', nowIso, nowIso)
+        .bind(`usr-${randomHex(8)}`, seedEmail, hash, salt, 'ADMIN', nowIso, nowIso)
         .run();
     }
   }
@@ -342,6 +351,8 @@ function getConfiguredEmailKeys(env: Record<string, any> | undefined): string[] 
 }
 
 function resolveEmailProviderConfig(env: Record<string, any> | undefined): { configured: boolean; provider?: string } {
+  if (env?.EMAIL?.send || env?.SEND_EMAIL?.send) return { configured: true, provider: 'cloudflare-email' };
+  if (pickEnv(env, ['EMAIL_WEBHOOK_URL', 'MAIL_WEBHOOK_URL', 'GAS_EMAIL_URL', 'OTP_WEBHOOK_URL'])) return { configured: true, provider: 'webhook' };
   if (pickEnv(env, ['RESEND_API_KEY', 'RESEND_KEY', 'RESEND_TOKEN', 'RESEND_SECRET'])) return { configured: true, provider: 'resend' };
   if (pickEnv(env, ['BREVO_API_KEY', 'BREVO_KEY', 'SIB_API_KEY'])) return { configured: true, provider: 'brevo' };
   if (pickEnv(env, ['SENDGRID_API_KEY', 'SENDGRID_KEY'])) return { configured: true, provider: 'sendgrid' };
@@ -350,7 +361,6 @@ function resolveEmailProviderConfig(env: Record<string, any> | undefined): { con
   if (pickEnv(env, ['SMTP2GO_API_KEY'])) return { configured: true, provider: 'smtp2go' };
   if (pickEnv(env, ['ZEPTOMAIL_API_KEY', 'ZEPTO_API_KEY'])) return { configured: true, provider: 'zeptomail' };
   if (pickEnv(env, ['MAILCHANNELS_API_KEY'])) return { configured: true, provider: 'mailchannels' };
-  if (pickEnv(env, ['EMAIL_WEBHOOK_URL', 'MAIL_WEBHOOK_URL', 'GAS_EMAIL_URL', 'OTP_WEBHOOK_URL'])) return { configured: true, provider: 'webhook' };
   return { configured: false };
 }
 
@@ -569,17 +579,41 @@ async function sendOtpEmail(
     }
   }
 
+  const emailBinding = env?.EMAIL?.send ? env.EMAIL : env?.SEND_EMAIL?.send ? env.SEND_EMAIL : null;
+  if (emailBinding && fromRaw) {
+    try {
+      await emailBinding.send({ to: email, from: sender.formatted, subject, html, text });
+      return { sent: true, provider: 'cloudflare-email' };
+    } catch (err: any) {
+      errors.push(`Cloudflare Email error: ${err?.message || 'gagal kirim'}`);
+    }
+  }
+
   const webhookUrl = pickEnv(env, ['EMAIL_WEBHOOK_URL', 'MAIL_WEBHOOK_URL', 'GAS_EMAIL_URL', 'OTP_WEBHOOK_URL']);
   if (webhookUrl) {
+    const webhookSecret = pickEnv(env, ['MAIL_WEBHOOK_SECRET', 'EMAIL_WEBHOOK_SECRET', 'GAS_EMAIL_SECRET', 'OTP_WEBHOOK_SECRET']);
     try {
       const res = await fetch(webhookUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: email, email, from: sender.formatted, subject, otp, code: otp, text, html }),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          secret: webhookSecret,
+          to: email,
+          email,
+          from: sender.formatted,
+          subject,
+          otp,
+          code: otp,
+          text,
+          html,
+        }),
+        redirect: 'follow',
       });
-      if (res.ok) return { sent: true, provider: 'webhook' };
-      const snippet = await readErrSnippet(res);
-      errors.push(`Webhook HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+      const reply = (await res.text().catch(() => '')).replace(/\s+/g, ' ').trim();
+      if (res.ok && reply.toLowerCase() !== 'forbidden' && reply.toLowerCase() !== 'error') {
+        return { sent: true, provider: 'webhook' };
+      }
+      errors.push(`Webhook HTTP ${res.status}${reply ? `: ${reply.slice(0, 180)}` : ''}`);
     } catch (err: any) {
       errors.push(`Webhook error: ${err?.message || 'gagal fetch'}`);
     }
@@ -590,7 +624,7 @@ async function sendOtpEmail(
   }
   return {
     sent: false,
-    error: 'Secret provider email (RESEND_API_KEY / BREVO_API_KEY / SENDGRID_API_KEY / EMAIL_WEBHOOK_URL) belum diatur pada Worker.',
+    error: 'Secret provider email (MAIL_WEBHOOK_URL / RESEND_API_KEY / BREVO_API_KEY / SENDGRID_API_KEY) belum diatur pada Worker.',
   };
 }
 
