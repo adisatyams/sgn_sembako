@@ -10,3 +10,6 @@ account_id = "0fb0eac92e0637fca3c730b55a2812eb"
 binding = "DB"
 database_name = "minyakku-d1"
 database_id = "c5c5d38c-c4d9-401f-929c-0c32940592e2"
+
+[vars]
+PAYMENT_NOTIF_URL = "https://payment-notif.adi-satya-ms.workers.dev"

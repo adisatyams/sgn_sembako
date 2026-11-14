@@ -15,6 +15,9 @@ export interface Env {
   SIPAJAK_NPWP?: string;
   SIPAJAK_USERNAME?: string;
   SIPAJAK_PASSWORD?: string;
+  PAYMENT_NOTIF_URL?: string;
+  PAYMENT_NOTIF_API_KEY?: string;
+  PAYMENT_NOTIF_WEBHOOK_SECRET?: string;
   RESEND_API_KEY?: string;
   RESEND_KEY?: string;
   RESEND_TOKEN?: string;
@@ -642,7 +645,7 @@ export default {
     const corsHeaders: Record<string, string> = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-KEY, Accept',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-KEY, X-Payment-Notif-Url, X-Payment-Notif-Key, Accept',
     };
 
     if (method === 'OPTIONS') {
@@ -2466,6 +2469,310 @@ export default {
             configured: true,
             message: parsed?.message || parsed?.data?.statusMessage || `HTTP ${upstream.status}`,
           }, { headers: corsHeaders });
+        }
+      }
+
+      // 6. Integrasi payment-notif (https://github.com/adisatyams/payment-notif)
+      if (pathname.startsWith('/api/payment-notif/')) {
+        const body: any = method === 'POST' ? await request.json().catch(() => ({})) : {};
+        const headerUrl = request.headers.get('X-Payment-Notif-Url') || '';
+        const headerKey = request.headers.get('X-Payment-Notif-Key') || '';
+        const baseUrl = String(
+          body?.paymentNotifUrl || headerUrl || env.PAYMENT_NOTIF_URL || ''
+        )
+          .trim()
+          .replace(/\/+$/, '');
+        const apiKey = String(
+          body?.paymentNotifApiKey || headerKey || env.PAYMENT_NOTIF_API_KEY || ''
+        ).trim();
+
+        const authHeaders: Record<string, string> = {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        };
+
+        // Webhook penerima callback otomatis dari payment-notif
+        if (pathname === '/api/payment-notif/webhook' && method === 'POST') {
+          const webhookSecret = String(env.PAYMENT_NOTIF_WEBHOOK_SECRET || '').trim();
+          const rawSig = request.headers.get('x-signature') || '';
+          if (webhookSecret && rawSig) {
+            try {
+              const key = await crypto.subtle.importKey(
+                'raw',
+                enc.encode(webhookSecret),
+                { name: 'HMAC', hash: 'SHA-256' },
+                false,
+                ['sign']
+              );
+              const signed = await crypto.subtle.sign('HMAC', key, enc.encode(JSON.stringify(body)));
+              const expectedHex = `sha256=${toHex(signed)}`;
+              if (rawSig !== expectedHex && rawSig !== toHex(signed)) {
+                return Response.json({ ok: false, error: 'Invalid webhook signature' }, { status: 401, headers: corsHeaders });
+              }
+            } catch {
+              // Abaikan bila body parsing berbeda urutan key
+            }
+          }
+
+          if (body?.event === 'payment.paid' && env.DB) {
+            try {
+              const rows = (await env.DB.prepare('SELECT * FROM purchase_orders').all()).results || [];
+              let updatedCount = 0;
+              for (const row of rows) {
+                let parsed: any = {};
+                try { parsed = row.data_json ? JSON.parse(String(row.data_json)) : {}; } catch {}
+                const matchRef = parsed.paymentNotifRef && body.ref && parsed.paymentNotifRef === body.ref;
+                const matchExt =
+                  body.external_ref &&
+                  (row.po_number === body.external_ref || row.id === body.external_ref || parsed.poNumber === body.external_ref);
+                const matchAmt =
+                  Number(body.amount_total || 0) > 0 &&
+                  (Math.round(Number(parsed.paymentNotifAmountTotal || 0)) === Math.round(Number(body.amount_total)) ||
+                    Math.round(Number(row.grand_total || parsed.grandTotal || 0)) === Math.round(Number(body.amount_base || body.amount_total)));
+
+                if ((matchRef || matchExt || matchAmt) && row.delivery_status !== 'CANCELLED') {
+                  const nextDelivery = row.delivery_status === 'DRAFT' ? 'ORDERED' : row.delivery_status || 'ORDERED';
+                  const updatedJson = JSON.stringify({
+                    ...parsed,
+                    paymentStatus: 'PAID',
+                    deliveryStatus: parsed.deliveryStatus === 'DRAFT' ? 'ORDERED' : (parsed.deliveryStatus || nextDelivery),
+                    paidAt: body.paid_at || new Date().toISOString(),
+                    paymentNotifRef: body.ref || parsed.paymentNotifRef,
+                    paymentNotifUniqueCode: body.unique_code ?? parsed.paymentNotifUniqueCode,
+                    paymentNotifAmountTotal: body.amount_total ?? parsed.paymentNotifAmountTotal,
+                    paymentNotifStatus: 'paid',
+                    paymentNotifPaidVia: body.paid_via || 'email',
+                    paymentNotifCheckedAt: new Date().toISOString(),
+                  });
+                  await env.DB.prepare(
+                    `UPDATE purchase_orders SET payment_status = 'PAID', delivery_status = ?1, data_json = ?2 WHERE id = ?3`
+                  )
+                    .bind(nextDelivery, updatedJson, row.id)
+                    .run();
+                  updatedCount++;
+                }
+              }
+              return Response.json({ ok: true, updatedPurchaseOrders: updatedCount }, { headers: corsHeaders });
+            } catch (err: any) {
+              return Response.json({ ok: false, error: err?.message || 'Gagal update PO di D1' }, { status: 500, headers: corsHeaders });
+            }
+          }
+          return Response.json({ ok: true, ignored: true }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/payment-notif/status' && (method === 'GET' || method === 'POST')) {
+          if (!baseUrl) {
+            return Response.json({
+              configured: false,
+              online: false,
+              hasUrl: false,
+              hasApiKey: Boolean(apiKey),
+              source: 'none',
+              message: 'URL Worker payment-notif belum diatur (isi di Pengaturan payment-notif atau secret PAYMENT_NOTIF_URL).',
+            }, { headers: corsHeaders });
+          }
+          try {
+            const hRes = await fetch(`${baseUrl}/health`, { headers: { Accept: 'application/json' } });
+            const hData: any = await hRes.json().catch(() => ({}));
+            let apiKeyValid = false;
+            let authError = '';
+            if (hRes.ok && apiKey) {
+              const pRes = await fetch(`${baseUrl}/api/payments?limit=1`, { headers: authHeaders });
+              apiKeyValid = pRes.ok;
+              if (!pRes.ok) authError = `HTTP ${pRes.status}`;
+            }
+            return Response.json({
+              configured: Boolean(baseUrl && apiKey),
+              online: hRes.ok && (hData?.ok !== false),
+              apiKeyValid,
+              hasUrl: true,
+              hasApiKey: Boolean(apiKey),
+              baseUrl,
+              source: env.PAYMENT_NOTIF_URL ? 'worker-secret' : 'client',
+              message: !hRes.ok
+                ? `payment-notif merespon HTTP ${hRes.status}`
+                : !apiKey
+                ? 'payment-notif online, tetapi API_KEY belum diisi.'
+                : apiKeyValid
+                ? 'Terhubung & terautentikasi dengan Worker payment-notif.'
+                : `payment-notif online, API Key ditolak (${authError || '401'}).`,
+            }, { headers: corsHeaders });
+          } catch (err: any) {
+            return Response.json({
+              configured: Boolean(baseUrl && apiKey),
+              online: false,
+              baseUrl,
+              message: `Gagal menghubungi payment-notif: ${err?.message || 'Network error'}`,
+            }, { headers: corsHeaders });
+          }
+        }
+
+        if (!baseUrl || !apiKey) {
+          return Response.json({
+            ok: false,
+            configured: false,
+            message: 'URL atau API Key Worker payment-notif belum dikonfigurasi.',
+          }, { status: 200, headers: corsHeaders });
+        }
+
+        if (pathname === '/api/payment-notif/create' && method === 'POST') {
+          const amount = Math.round(Number(body?.amount || 0));
+          if (amount <= 0) {
+            return Response.json({ ok: false, error: 'Nominal tagihan PO tidak valid.' }, { status: 400, headers: corsHeaders });
+          }
+          const upstream = await fetch(`${baseUrl}/api/payments`, {
+            method: 'POST',
+            headers: authHeaders,
+            body: JSON.stringify({
+              amount,
+              customer: body?.customer || undefined,
+              external_ref: body?.external_ref || undefined,
+            }),
+          });
+          const data: any = await upstream.json().catch(() => ({}));
+          if (!upstream.ok) {
+            return Response.json({
+              ok: false,
+              configured: true,
+              status: upstream.status,
+              error: data?.error || `HTTP ${upstream.status} dari payment-notif`,
+            }, { status: 200, headers: corsHeaders });
+          }
+          return Response.json({ ok: true, configured: true, payment: data }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/payment-notif/check' && (method === 'POST' || method === 'GET')) {
+          const requestedOrders: any[] = Array.isArray(body?.orders)
+            ? body.orders
+            : body?.poNumber || body?.ref || url.searchParams.get('poNumber') || url.searchParams.get('ref')
+            ? [{
+                id: body?.poId || body?.id || '',
+                poNumber: body?.poNumber || url.searchParams.get('poNumber') || '',
+                grandTotal: Number(body?.amount || url.searchParams.get('amount') || 0),
+                paymentNotifRef: body?.ref || url.searchParams.get('ref') || undefined,
+                paymentNotifAmountTotal: Number(body?.paymentNotifAmountTotal || 0) || undefined,
+              }]
+            : [];
+
+          const [allPaymentsRes, notifsRes] = await Promise.all([
+            fetch(`${baseUrl}/api/payments?limit=150`, { headers: authHeaders }),
+            fetch(`${baseUrl}/api/notifs?limit=100`, { headers: authHeaders }).catch(() => null),
+          ]);
+
+          if (!allPaymentsRes.ok) {
+            const errJson: any = await allPaymentsRes.json().catch(() => ({}));
+            return Response.json({
+              ok: false,
+              configured: true,
+              error: errJson?.error || `payment-notif HTTP ${allPaymentsRes.status}`,
+            }, { status: 200, headers: corsHeaders });
+          }
+
+          const allPaymentsRaw: any = await allPaymentsRes.json().catch(() => []);
+          const payments: any[] = Array.isArray(allPaymentsRaw) ? allPaymentsRaw : [];
+          const notifsRaw: any = notifsRes && notifsRes.ok ? await notifsRes.json().catch(() => []) : [];
+          const notifs: any[] = Array.isArray(notifsRaw) ? notifsRaw : [];
+
+          const results: any[] = [];
+          for (const ord of requestedOrders) {
+            let matchedPayment =
+              (ord.paymentNotifRef && payments.find((p: any) => p.ref === ord.paymentNotifRef)) ||
+              payments.find((p: any) => p.external_ref && (p.external_ref === ord.poNumber || p.external_ref === ord.id)) ||
+              payments.find(
+                (p: any) =>
+                  p.status === 'paid' &&
+                  (Math.round(Number(p.amount_total)) === Math.round(Number(ord.paymentNotifAmountTotal || ord.grandTotal || 0)) ||
+                    Math.round(Number(p.amount_base)) === Math.round(Number(ord.grandTotal || 0)))
+              );
+
+            if (!matchedPayment && ord.paymentNotifRef) {
+              const singleRes = await fetch(`${baseUrl}/api/payments/${encodeURIComponent(ord.paymentNotifRef)}`, {
+                headers: authHeaders,
+              }).catch(() => null);
+              if (singleRes && singleRes.ok) {
+                matchedPayment = await singleRes.json().catch(() => null);
+              }
+            }
+
+            let matchedByNotif: any = null;
+            if (!matchedPayment && (ord.paymentNotifAmountTotal || ord.grandTotal)) {
+              const targetAmounts = new Set<number>();
+              if (Number(ord.paymentNotifAmountTotal) > 0) targetAmounts.add(Math.round(Number(ord.paymentNotifAmountTotal)));
+              if (Number(ord.grandTotal) > 0) targetAmounts.add(Math.round(Number(ord.grandTotal)));
+              for (const n of notifs) {
+                let parsedAmounts: number[] = [];
+                try {
+                  parsedAmounts = Array.isArray(n.amounts_json) ? n.amounts_json : JSON.parse(String(n.amounts_json || '[]'));
+                } catch {}
+                if (parsedAmounts.some((a) => targetAmounts.has(Math.round(Number(a))))) {
+                  matchedByNotif = n;
+                  break;
+                }
+              }
+            }
+
+            const isPaid =
+              matchedPayment?.status === 'paid' ||
+              Boolean(matchedByNotif);
+
+            results.push({
+              poId: ord.id,
+              poNumber: ord.poNumber,
+              matched: Boolean(matchedPayment || matchedByNotif),
+              paid: isPaid,
+              status: matchedPayment?.status || (matchedByNotif ? 'paid' : 'unmatched'),
+              payment: matchedPayment || null,
+              notif: matchedByNotif
+                ? {
+                    id: matchedByNotif.id,
+                    sender: matchedByNotif.sender,
+                    subject: matchedByNotif.subject,
+                    receivedAt: matchedByNotif.received_at,
+                  }
+                : null,
+            });
+          }
+
+          return Response.json({
+            ok: true,
+            configured: true,
+            totalChecked: requestedOrders.length,
+            paidCount: results.filter((r) => r.paid).length,
+            results,
+          }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/payment-notif/confirm' && method === 'POST') {
+          const ref = String(body?.ref || '').trim();
+          if (!ref) {
+            return Response.json({ ok: false, error: 'Ref pembayaran wajib diisi.' }, { status: 400, headers: corsHeaders });
+          }
+          const upstream = await fetch(`${baseUrl}/api/payments/${encodeURIComponent(ref)}/confirm`, {
+            method: 'POST',
+            headers: authHeaders,
+          });
+          const data: any = await upstream.json().catch(() => ({}));
+          return Response.json(
+            upstream.ok ? { ok: true, ...data } : { ok: false, error: data?.error || `HTTP ${upstream.status}` },
+            { status: 200, headers: corsHeaders }
+          );
+        }
+
+        if (pathname === '/api/payment-notif/cancel' && method === 'POST') {
+          const ref = String(body?.ref || '').trim();
+          if (!ref) {
+            return Response.json({ ok: false, error: 'Ref pembayaran wajib diisi.' }, { status: 400, headers: corsHeaders });
+          }
+          const upstream = await fetch(`${baseUrl}/api/payments/${encodeURIComponent(ref)}/cancel`, {
+            method: 'POST',
+            headers: authHeaders,
+          });
+          const data: any = await upstream.json().catch(() => ({}));
+          return Response.json(
+            upstream.ok ? { ok: true, ...data } : { ok: false, error: data?.error || `HTTP ${upstream.status}` },
+            { status: 200, headers: corsHeaders }
+          );
         }
       }
 
