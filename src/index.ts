@@ -15,6 +15,162 @@ export interface Env {
   SIPAJAK_NPWP?: string;
   SIPAJAK_USERNAME?: string;
   SIPAJAK_PASSWORD?: string;
+  RESEND_API_KEY?: string;
+  AUTH_FROM_EMAIL?: string;
+  AUTH_ADMIN_EMAIL?: string;
+  AUTH_ADMIN_PASSWORD?: string;
+}
+
+const enc = new TextEncoder();
+
+function toHex(buf: ArrayBuffer | Uint8Array): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function fromHex(hex: string): Uint8Array {
+  const clean = hex.replace(/[^0-9a-f]/gi, '');
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+function randomHex(byteLength = 16): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return toHex(bytes);
+}
+
+function generateOtp6(): string {
+  const bytes = new Uint32Array(1);
+  crypto.getRandomValues(bytes);
+  return String(100000 + (bytes[0] % 900000));
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', enc.encode(text));
+  return toHex(digest);
+}
+
+async function hashPasswordPBKDF2(password: string, saltHex?: string): Promise<{ hash: string; salt: string }> {
+  const salt = saltHex || randomHex(16);
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const derived = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: fromHex(salt), iterations: 100_000, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return { hash: toHex(derived), salt };
+}
+
+async function verifyPasswordPBKDF2(password: string, saltHex: string, expectedHash: string): Promise<boolean> {
+  const { hash } = await hashPasswordPBKDF2(password, saltHex);
+  if (hash.length !== expectedHash.length) return false;
+  let diff = 0;
+  for (let i = 0; i < hash.length; i++) {
+    diff |= hash.charCodeAt(i) ^ expectedHash.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function maskEmail(email: string): string {
+  const [local = '', domain = ''] = String(email || '').split('@');
+  if (!domain) return email;
+  const visible = local.slice(0, 2);
+  return `${visible}${'*'.repeat(Math.max(2, local.length - 2))}@${domain}`;
+}
+
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isStrongPassword(password: string): boolean {
+  return password.length >= 10 && /[A-Za-z]/.test(password) && /[0-9]/.test(password);
+}
+
+function extractBearerToken(request: Request): string {
+  const auth = request.headers.get('Authorization') || '';
+  if (auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
+  return '';
+}
+
+async function ensureAuthTables(db: any, env?: Env): Promise<void> {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS auth_users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      role TEXT DEFAULT 'ADMIN',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS auth_challenges (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      last_sent_at INTEGER NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      used INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS auth_sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`),
+  ]);
+
+  if (env?.AUTH_ADMIN_EMAIL && env?.AUTH_ADMIN_PASSWORD) {
+    const countRow: any = await db.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
+    if (Number(countRow?.cnt || 0) === 0) {
+      const adminEmail = env.AUTH_ADMIN_EMAIL.trim().toLowerCase();
+      const { hash, salt } = await hashPasswordPBKDF2(env.AUTH_ADMIN_PASSWORD);
+      await db
+        .prepare('INSERT OR IGNORE INTO auth_users (id, email, password_hash, password_salt, role) VALUES (?1, ?2, ?3, ?4, ?5)')
+        .bind(`usr-${randomHex(8)}`, adminEmail, hash, salt, 'ADMIN')
+        .run();
+    }
+  }
+}
+
+async function sendOtpEmail(env: Env, email: string, otp: string): Promise<{ sent: boolean; provider?: string }> {
+  if (!env.RESEND_API_KEY) {
+    return { sent: false };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: env.AUTH_FROM_EMAIL || 'SGN Sembako <onboarding@resend.dev>',
+        to: [email],
+        subject: `Kode Verifikasi Login SGN Sembako: ${otp}`,
+        html: `<div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;">
+          <h2 style="color:#0f172a;margin:0 0 8px;">Verifikasi 2 Langkah SGN Sembako</h2>
+          <p style="color:#475569;font-size:14px;">Gunakan kode 6 digit berikut untuk menyelesaikan login ke ERP (berlaku 5 menit):</p>
+          <div style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#d97706;background:#fffbeb;padding:16px;text-align:center;border-radius:8px;margin:16px 0;">${otp}</div>
+          <p style="color:#64748b;font-size:12px;">Jika Anda tidak mencoba masuk, abaikan email ini.</p>
+        </div>`,
+      }),
+    });
+    return { sent: res.ok, provider: 'resend' };
+  } catch {
+    return { sent: false };
+  }
 }
 
 function getDbClient(env: Env): Client {
@@ -80,6 +236,327 @@ export default {
           db_type: dbType,
           message: dbOk ? `Terhubung ke ${dbType}` : 'Worker aktif (Menunggu konfigurasi database)'
         }, { headers: corsHeaders });
+      }
+
+      // 1B. Autentikasi + 2FA (/api/auth/*)
+      if (pathname.startsWith('/api/auth/')) {
+        if (!env.DB) {
+          return Response.json(
+            { error: 'Cloudflare D1 belum terhubung ke Worker.' },
+            { status: 500, headers: corsHeaders }
+          );
+        }
+
+        await ensureAuthTables(env.DB, env);
+
+        if (pathname === '/api/auth/setup-status' && method === 'GET') {
+          const countRow: any = await env.DB.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
+          return Response.json(
+            {
+              hasUsers: Number(countRow?.cnt || 0) > 0,
+              emailProviderConfigured: Boolean(env.RESEND_API_KEY),
+            },
+            { headers: corsHeaders }
+          );
+        }
+
+        if (pathname === '/api/auth/setup' && method === 'POST') {
+          const countRow: any = await env.DB.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
+          if (Number(countRow?.cnt || 0) > 0) {
+            return Response.json(
+              { error: 'Akun admin sudah terdaftar. Silakan login dengan akun Anda.' },
+              { status: 403, headers: corsHeaders }
+            );
+          }
+          const body: any = await request.json().catch(() => ({}));
+          const email = String(body.email || '').trim().toLowerCase();
+          const password = String(body.password || '');
+          if (!isValidEmail(email)) {
+            return Response.json({ error: 'Format email tidak valid.' }, { status: 400, headers: corsHeaders });
+          }
+          if (!isStrongPassword(password)) {
+            return Response.json(
+              { error: 'Password minimal 10 karakter dan harus mengandung huruf serta angka.' },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const userId = `usr-${randomHex(8)}`;
+          const { hash, salt } = await hashPasswordPBKDF2(password);
+          await env.DB.prepare(
+            'INSERT INTO auth_users (id, email, password_hash, password_salt, role) VALUES (?1, ?2, ?3, ?4, ?5)'
+          )
+            .bind(userId, email, hash, salt, 'ADMIN')
+            .run();
+
+          const challengeId = `chg-${randomHex(16)}`;
+          const otp = generateOtp6();
+          const codeHash = await sha256Hex(`${otp}:${challengeId}`);
+          const now = Date.now();
+          await env.DB.prepare(
+            'INSERT INTO auth_challenges (id, user_id, email, code_hash, expires_at, last_sent_at, attempts, used) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)'
+          )
+            .bind(challengeId, userId, email, codeHash, now + 5 * 60 * 1000, now)
+            .run();
+
+          const mailResult = await sendOtpEmail(env, email, otp);
+          return Response.json(
+            {
+              ok: true,
+              challengeId,
+              email: maskEmail(email),
+              resendAfterSec: 60,
+              emailSent: mailResult.sent,
+              ...(mailResult.sent ? {} : { devOtp: otp }),
+            },
+            { headers: corsHeaders }
+          );
+        }
+
+        if (pathname === '/api/auth/login' && method === 'POST') {
+          const body: any = await request.json().catch(() => ({}));
+          const email = String(body.email || '').trim().toLowerCase();
+          const password = String(body.password || '');
+          if (!email || !password) {
+            return Response.json(
+              { error: 'Email dan password wajib diisi.' },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const countRow: any = await env.DB.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
+          if (Number(countRow?.cnt || 0) === 0) {
+            return Response.json(
+              {
+                error: 'Belum ada akun admin terdaftar di server ini. Silakan buat akun admin pertama.',
+                needsSetup: true,
+              },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const user: any = await env.DB.prepare('SELECT * FROM auth_users WHERE email = ?1 LIMIT 1')
+            .bind(email)
+            .first();
+          if (!user) {
+            return Response.json({ error: 'Email atau password salah.' }, { status: 401, headers: corsHeaders });
+          }
+
+          const ok = await verifyPasswordPBKDF2(password, String(user.password_salt), String(user.password_hash));
+          if (!ok) {
+            return Response.json({ error: 'Email atau password salah.' }, { status: 401, headers: corsHeaders });
+          }
+
+          const challengeId = `chg-${randomHex(16)}`;
+          const otp = generateOtp6();
+          const codeHash = await sha256Hex(`${otp}:${challengeId}`);
+          const now = Date.now();
+          await env.DB.prepare(
+            'INSERT INTO auth_challenges (id, user_id, email, code_hash, expires_at, last_sent_at, attempts, used) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)'
+          )
+            .bind(challengeId, user.id, user.email, codeHash, now + 5 * 60 * 1000, now)
+            .run();
+
+          const mailResult = await sendOtpEmail(env, String(user.email), otp);
+          return Response.json(
+            {
+              ok: true,
+              challengeId,
+              email: maskEmail(String(user.email)),
+              resendAfterSec: 60,
+              emailSent: mailResult.sent,
+              ...(mailResult.sent ? {} : { devOtp: otp }),
+            },
+            { headers: corsHeaders }
+          );
+        }
+
+        if (pathname === '/api/auth/verify-2fa' && method === 'POST') {
+          const body: any = await request.json().catch(() => ({}));
+          const challengeId = String(body.challengeId || '').trim();
+          const code = String(body.code || '').replace(/\D/g, '');
+          if (!challengeId || code.length !== 6) {
+            return Response.json(
+              { error: 'Kode verifikasi harus 6 digit.' },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const ch: any = await env.DB.prepare('SELECT * FROM auth_challenges WHERE id = ?1 LIMIT 1')
+            .bind(challengeId)
+            .first();
+          if (!ch || Number(ch.used) === 1) {
+            return Response.json(
+              { error: 'Sesi verifikasi sudah tidak berlaku. Silakan login ulang.', restart: true },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+          if (Date.now() > Number(ch.expires_at)) {
+            await env.DB.prepare('UPDATE auth_challenges SET used = 1 WHERE id = ?1').bind(challengeId).run();
+            return Response.json(
+              { error: 'Kode verifikasi kedaluwarsa. Silakan login ulang.', restart: true },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const nextAttempts = Number(ch.attempts || 0) + 1;
+          const expectedHash = await sha256Hex(`${code}:${challengeId}`);
+          if (expectedHash !== String(ch.code_hash)) {
+            if (nextAttempts >= 5) {
+              await env.DB.prepare('UPDATE auth_challenges SET attempts = ?1, used = 1 WHERE id = ?2')
+                .bind(nextAttempts, challengeId)
+                .run();
+              return Response.json(
+                { error: 'Terlalu banyak percobaan salah. Silakan login ulang.', restart: true },
+                { status: 401, headers: corsHeaders }
+              );
+            }
+            await env.DB.prepare('UPDATE auth_challenges SET attempts = ?1 WHERE id = ?2')
+              .bind(nextAttempts, challengeId)
+              .run();
+            return Response.json({ error: 'Kode verifikasi 6 digit salah.' }, { status: 401, headers: corsHeaders });
+          }
+
+          const token = randomHex(32);
+          const tokenHash = await sha256Hex(token);
+          const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+          await env.DB.batch([
+            env.DB.prepare('UPDATE auth_challenges SET used = 1 WHERE id = ?1').bind(challengeId),
+            env.DB.prepare(
+              'INSERT INTO auth_sessions (token_hash, user_id, email, expires_at) VALUES (?1, ?2, ?3, ?4)'
+            ).bind(tokenHash, ch.user_id, ch.email, expiresAt),
+          ]);
+
+          return Response.json(
+            {
+              ok: true,
+              token,
+              expiresAt,
+              user: { email: ch.email },
+            },
+            { headers: corsHeaders }
+          );
+        }
+
+        if (pathname === '/api/auth/resend' && method === 'POST') {
+          const body: any = await request.json().catch(() => ({}));
+          const challengeId = String(body.challengeId || '').trim();
+          const ch: any = await env.DB.prepare('SELECT * FROM auth_challenges WHERE id = ?1 LIMIT 1')
+            .bind(challengeId)
+            .first();
+          if (!ch || Number(ch.used) === 1 || Date.now() > Number(ch.expires_at)) {
+            return Response.json(
+              { error: 'Sesi verifikasi berakhir. Silakan login ulang.', restart: true },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const now = Date.now();
+          const elapsed = now - Number(ch.last_sent_at || 0);
+          if (elapsed < 60_000) {
+            const retryAfterSec = Math.max(1, Math.ceil((60_000 - elapsed) / 1000));
+            return Response.json(
+              { error: `Tunggu ${retryAfterSec} detik sebelum mengirim ulang kode.`, retryAfterSec },
+              { status: 429, headers: corsHeaders }
+            );
+          }
+
+          const otp = generateOtp6();
+          const codeHash = await sha256Hex(`${otp}:${challengeId}`);
+          await env.DB.prepare(
+            'UPDATE auth_challenges SET code_hash = ?1, expires_at = ?2, last_sent_at = ?3, attempts = 0 WHERE id = ?4'
+          )
+            .bind(codeHash, now + 5 * 60 * 1000, now, challengeId)
+            .run();
+
+          const mailResult = await sendOtpEmail(env, String(ch.email), otp);
+          return Response.json(
+            {
+              ok: true,
+              resendAfterSec: 60,
+              emailSent: mailResult.sent,
+              ...(mailResult.sent ? {} : { devOtp: otp }),
+            },
+            { headers: corsHeaders }
+          );
+        }
+
+        if (pathname === '/api/auth/me' && method === 'GET') {
+          const token = extractBearerToken(request);
+          if (!token) {
+            return Response.json({ error: 'Token sesi tidak ditemukan.' }, { status: 401, headers: corsHeaders });
+          }
+          const tokenHash = await sha256Hex(token);
+          const session: any = await env.DB.prepare(
+            'SELECT * FROM auth_sessions WHERE token_hash = ?1 AND expires_at > ?2 LIMIT 1'
+          )
+            .bind(tokenHash, Date.now())
+            .first();
+          if (!session) {
+            return Response.json({ error: 'Sesi login tidak valid atau kedaluwarsa.' }, { status: 401, headers: corsHeaders });
+          }
+          return Response.json({ ok: true, user: { email: session.email } }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/auth/logout' && method === 'POST') {
+          const token = extractBearerToken(request);
+          if (token) {
+            const tokenHash = await sha256Hex(token);
+            await env.DB.prepare('DELETE FROM auth_sessions WHERE token_hash = ?1').bind(tokenHash).run();
+          }
+          return Response.json({ ok: true }, { headers: corsHeaders });
+        }
+
+        if (pathname === '/api/auth/change-password' && method === 'POST') {
+          const token = extractBearerToken(request);
+          if (!token) {
+            return Response.json({ error: 'Sesi berakhir. Silakan login ulang.' }, { status: 401, headers: corsHeaders });
+          }
+          const tokenHash = await sha256Hex(token);
+          const session: any = await env.DB.prepare(
+            'SELECT * FROM auth_sessions WHERE token_hash = ?1 AND expires_at > ?2 LIMIT 1'
+          )
+            .bind(tokenHash, Date.now())
+            .first();
+          if (!session) {
+            return Response.json({ error: 'Sesi berakhir. Silakan login ulang.' }, { status: 401, headers: corsHeaders });
+          }
+
+          const body: any = await request.json().catch(() => ({}));
+          const currentPassword = String(body.currentPassword || '');
+          const newPassword = String(body.newPassword || '');
+          if (!isStrongPassword(newPassword)) {
+            return Response.json(
+              { error: 'Password baru minimal 10 karakter dan harus mengandung huruf serta angka.' },
+              { status: 400, headers: corsHeaders }
+            );
+          }
+
+          const user: any = await env.DB.prepare('SELECT * FROM auth_users WHERE id = ?1 LIMIT 1')
+            .bind(session.user_id)
+            .first();
+          if (!user) {
+            return Response.json({ error: 'Pengguna tidak ditemukan.' }, { status: 404, headers: corsHeaders });
+          }
+
+          const currentOk = await verifyPasswordPBKDF2(
+            currentPassword,
+            String(user.password_salt),
+            String(user.password_hash)
+          );
+          if (!currentOk) {
+            return Response.json({ error: 'Password saat ini salah.' }, { status: 401, headers: corsHeaders });
+          }
+
+          const { hash, salt } = await hashPasswordPBKDF2(newPassword);
+          await env.DB.prepare(
+            'UPDATE auth_users SET password_hash = ?1, password_salt = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3'
+          )
+            .bind(hash, salt, user.id)
+            .run();
+
+          return Response.json({ ok: true, message: 'Password berhasil diperbarui.' }, { headers: corsHeaders });
+        }
       }
 
       // 2. Init DB
@@ -341,7 +818,8 @@ export default {
           try {
             await env.DB.prepare('ALTER TABLE sales_orders ADD COLUMN unique_transfer_amount REAL DEFAULT 0').run();
           } catch {}
-          return Response.json({ success: true, message: '15 Tabel Cloudflare D1 SQLite berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
+          await ensureAuthTables(env.DB, env);
+          return Response.json({ success: true, message: '18 Tabel Cloudflare D1 SQLite (15 ERP + 3 Auth/2FA) berhasil disiapkan (5GB Storage Siap)!' }, { headers: corsHeaders });
         }
 
         // Aiven PostgreSQL Fallback
