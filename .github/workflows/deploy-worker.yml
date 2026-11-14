@@ -18,7 +18,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Deploy to Cloudflare Workers via Wrangler Latest
         uses: cloudflare/wrangler-action@v3
