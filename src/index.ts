@@ -100,6 +100,32 @@ function extractBearerToken(request: Request): string {
   return '';
 }
 
+async function getTableColumns(db: any, table: string): Promise<Array<{ name: string; notnull: number; dflt_value: any; pk: number }>> {
+  try {
+    const res = await db.prepare(`PRAGMA table_info(${table})`).all();
+    return Array.isArray(res?.results) ? res.results : [];
+  } catch {
+    return [];
+  }
+}
+
+async function addMissingColumns(
+  db: any,
+  table: string,
+  existingNames: Set<string>,
+  required: Array<[string, string]>
+): Promise<void> {
+  for (const [colName, colDef] of required) {
+    if (!existingNames.has(colName)) {
+      try {
+        await db.prepare(`ALTER TABLE ${table} ADD COLUMN ${colName} ${colDef}`).run();
+      } catch {
+        /* abaikan jika kolom sudah ditambahkan oleh request paralel */
+      }
+    }
+  }
+}
+
 async function ensureAuthTables(db: any, env?: Env): Promise<void> {
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS auth_users (
@@ -130,6 +156,84 @@ async function ensureAuthTables(db: any, env?: Env): Promise<void> {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`),
   ]);
+
+  // Migrasi aman untuk tabel auth lama di D1 yang mungkin memiliki skema berbeda
+  const userCols = await getTableColumns(db, 'auth_users');
+  const userColNames = new Set(userCols.map((c) => String(c.name)));
+  await addMissingColumns(db, 'auth_users', userColNames, [
+    ['email', "TEXT DEFAULT ''"],
+    ['password_hash', "TEXT DEFAULT ''"],
+    ['password_salt', "TEXT DEFAULT ''"],
+    ['role', "TEXT DEFAULT 'ADMIN'"],
+    ['created_at', 'DATETIME'],
+    ['updated_at', 'DATETIME'],
+  ]);
+
+  const challengeCols = await getTableColumns(db, 'auth_challenges');
+  const allowedChallengeCols = new Set(['id', 'user_id', 'email', 'code_hash', 'expires_at', 'last_sent_at', 'attempts', 'used', 'created_at']);
+  const hasBlockingChallengeCol =
+    !challengeCols.some((c) => c.name === 'id') ||
+    challengeCols.some(
+      (c) =>
+        !allowedChallengeCols.has(String(c.name)) &&
+        ((Number(c.notnull) === 1 && c.dflt_value === null) || Number(c.pk) === 1)
+    );
+
+  if (hasBlockingChallengeCol) {
+    await db.prepare('DROP TABLE IF EXISTS auth_challenges').run();
+    await db.prepare(`CREATE TABLE auth_challenges (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      last_sent_at INTEGER NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      used INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`).run();
+  } else {
+    const chColNames = new Set(challengeCols.map((c) => String(c.name)));
+    await addMissingColumns(db, 'auth_challenges', chColNames, [
+      ['user_id', "TEXT DEFAULT ''"],
+      ['email', "TEXT DEFAULT ''"],
+      ['code_hash', "TEXT DEFAULT ''"],
+      ['expires_at', 'INTEGER DEFAULT 0'],
+      ['last_sent_at', 'INTEGER DEFAULT 0'],
+      ['attempts', 'INTEGER DEFAULT 0'],
+      ['used', 'INTEGER DEFAULT 0'],
+      ['created_at', 'DATETIME'],
+    ]);
+  }
+
+  const sessionCols = await getTableColumns(db, 'auth_sessions');
+  const allowedSessionCols = new Set(['token_hash', 'user_id', 'email', 'expires_at', 'created_at']);
+  const hasBlockingSessionCol =
+    !sessionCols.some((c) => c.name === 'token_hash') ||
+    sessionCols.some(
+      (c) =>
+        !allowedSessionCols.has(String(c.name)) &&
+        ((Number(c.notnull) === 1 && c.dflt_value === null) || Number(c.pk) === 1)
+    );
+
+  if (hasBlockingSessionCol) {
+    await db.prepare('DROP TABLE IF EXISTS auth_sessions').run();
+    await db.prepare(`CREATE TABLE auth_sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`).run();
+  } else {
+    const sesColNames = new Set(sessionCols.map((c) => String(c.name)));
+    await addMissingColumns(db, 'auth_sessions', sesColNames, [
+      ['user_id', "TEXT DEFAULT ''"],
+      ['email', "TEXT DEFAULT ''"],
+      ['expires_at', 'INTEGER DEFAULT 0'],
+      ['created_at', 'DATETIME'],
+    ]);
+  }
 
   if (env?.AUTH_ADMIN_EMAIL && env?.AUTH_ADMIN_PASSWORD) {
     const countRow: any = await db.prepare('SELECT COUNT(*) AS cnt FROM auth_users').first();
@@ -417,6 +521,12 @@ export default {
             return Response.json({ error: 'Kode verifikasi 6 digit salah.' }, { status: 401, headers: corsHeaders });
           }
 
+          let resolvedEmail = String(ch.email || '').trim();
+          if (!resolvedEmail && ch.user_id) {
+            const uRow: any = await env.DB.prepare('SELECT email FROM auth_users WHERE id = ?1 LIMIT 1').bind(ch.user_id).first();
+            resolvedEmail = String(uRow?.email || '');
+          }
+
           const token = randomHex(32);
           const tokenHash = await sha256Hex(token);
           const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
@@ -424,7 +534,7 @@ export default {
             env.DB.prepare('UPDATE auth_challenges SET used = 1 WHERE id = ?1').bind(challengeId),
             env.DB.prepare(
               'INSERT INTO auth_sessions (token_hash, user_id, email, expires_at) VALUES (?1, ?2, ?3, ?4)'
-            ).bind(tokenHash, ch.user_id, ch.email, expiresAt),
+            ).bind(tokenHash, ch.user_id, resolvedEmail, expiresAt),
           ]);
 
           return Response.json(
@@ -432,7 +542,7 @@ export default {
               ok: true,
               token,
               expiresAt,
-              user: { email: ch.email },
+              user: { email: resolvedEmail },
             },
             { headers: corsHeaders }
           );
@@ -461,6 +571,12 @@ export default {
             );
           }
 
+          let resolvedEmail = String(ch.email || '').trim();
+          if (!resolvedEmail && ch.user_id) {
+            const uRow: any = await env.DB.prepare('SELECT email FROM auth_users WHERE id = ?1 LIMIT 1').bind(ch.user_id).first();
+            resolvedEmail = String(uRow?.email || '');
+          }
+
           const otp = generateOtp6();
           const codeHash = await sha256Hex(`${otp}:${challengeId}`);
           await env.DB.prepare(
@@ -469,7 +585,7 @@ export default {
             .bind(codeHash, now + 5 * 60 * 1000, now, challengeId)
             .run();
 
-          const mailResult = await sendOtpEmail(env, String(ch.email), otp);
+          const mailResult = await sendOtpEmail(env, resolvedEmail, otp);
           return Response.json(
             {
               ok: true,
@@ -495,7 +611,12 @@ export default {
           if (!session) {
             return Response.json({ error: 'Sesi login tidak valid atau kedaluwarsa.' }, { status: 401, headers: corsHeaders });
           }
-          return Response.json({ ok: true, user: { email: session.email } }, { headers: corsHeaders });
+          let resolvedEmail = String(session.email || '').trim();
+          if (!resolvedEmail && session.user_id) {
+            const uRow: any = await env.DB.prepare('SELECT email FROM auth_users WHERE id = ?1 LIMIT 1').bind(session.user_id).first();
+            resolvedEmail = String(uRow?.email || '');
+          }
+          return Response.json({ ok: true, user: { email: resolvedEmail } }, { headers: corsHeaders });
         }
 
         if (pathname === '/api/auth/logout' && method === 'POST') {
